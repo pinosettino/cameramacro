@@ -1,0 +1,18 @@
+MACRO – fotocamera macro per Android (Camera2, nessun browser)
+
+COME OTTENERE L'APK CON GITHUB
+1. Su github.com crea un repository nuovo (anche privato).
+2. Estrai lo zip sul PC. Carica TUTTO il contenuto nel repository
+   ("Add file" > "Upload files"), compresa la cartella .github
+   (se il browser la salta: "Add file" > "Create new file", scrivi come nome
+   .github/workflows/build.yml e incolla il contenuto del file omonimo).
+3. Vai nella scheda "Actions": parte da solo "Build APK" (3-6 minuti).
+   Se non parte: Actions > Build APK > Run workflow.
+4. Quando è verde, apri l'esecuzione e scarica "MacroCam-apk" in fondo
+   alla pagina (è uno zip: dentro c'è app-debug.apk).
+5. Sul telefono copia l'APK, aprilo e consenti l'installazione da fonti sconosciute.
+
+PRIMA PROVA
+Impostazioni (ingranaggio) > Diagnostica: dice se il telefono permette fuoco
+manuale e ISO manuale, e quale distanza minima dichiara.
+Se il build fallisce, copia l'errore dalla scheda Actions e mandamelo.
