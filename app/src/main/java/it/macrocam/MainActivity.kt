@@ -51,6 +51,7 @@ import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 import android.util.Size
+import android.util.TypedValue
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.OrientationEventListener
@@ -320,6 +321,8 @@ class MainActivity : Activity() {
     private lateinit var tvAuto: TextView
     private lateinit var tvLock: TextView
     private val isoBtns = ArrayList<TextView>()
+    private val topChips = ArrayList<TextView>()
+    private lateinit var hdrV: LinearLayout
     private val ui = Handler(Looper.getMainLooper())
     private var settingsBox: LinearLayout? = null
     private var dlg: AlertDialog? = null
@@ -382,6 +385,8 @@ class MainActivity : Activity() {
     // ---- voce ----
     private var voiceOn = false
     private var sr: SpeechRecognizer? = null
+    private var voiceStatus = ""
+    private var lastNote = 0L
 
     private val oriL by lazy {
         object : OrientationEventListener(this) {
@@ -460,7 +465,7 @@ class MainActivity : Activity() {
     // =====================================================================
     private fun chip(t: String) = TextView(this).apply {
         text = t
-        textSize = 13f
+        textSize = 12f
         typeface = Typeface.DEFAULT_BOLD
         setTextColor(Color.WHITE)
         gravity = Gravity.CENTER
@@ -477,20 +482,26 @@ class MainActivity : Activity() {
             gravity = Gravity.CENTER_VERTICAL
             setPadding(dp(6), dp(2), dp(8), 0)
         }
+        hdrV = hdr
         val gear = TextView(this).apply {
             text = "⚙"; textSize = 24f; setTextColor(0xFFB4B4B8.toInt()); gravity = Gravity.CENTER
             setOnClickListener { showSettings() }
         }
         hdr.addView(gear, LinearLayout.LayoutParams(dp(34), dp(40)))
-        hdr.addView(chip("ISO:").apply { setPadding(dp(2), dp(8), dp(4), dp(8)) })
+        val isoLbl = chip("ISO:").apply { setPadding(dp(2), dp(8), dp(4), dp(8)) }
+        topChips.add(isoLbl)
+        hdr.addView(isoLbl)
         for (i in intArrayOf(50, 100, 200, 400, 0)) {
             val t = chip(if (i == 0) "AUTO" else "$i").apply { tag = i; setOnClickListener { setIso(i) } }
             isoBtns.add(t)
+            topChips.add(t)
             hdr.addView(t)
         }
         tvMacro = chip("MACRO").apply { setOnClickListener { setMacro(!macroOn) } }
+        topChips.add(tvMacro)
         hdr.addView(tvMacro, LinearLayout.LayoutParams(WC, WC).apply { marginStart = dp(8) })
         tvTime = chip("1:—").apply { gravity = Gravity.END }
+        topChips.add(tvTime)
         hdr.addView(tvTime, LinearLayout.LayoutParams(0, WC, 1f))
         root.addView(hdr, LinearLayout.LayoutParams(MP, WC))
 
@@ -505,6 +516,8 @@ class MainActivity : Activity() {
         wrow.addView(wb, LinearLayout.LayoutParams(0, dp(40), 1f))
         tvAuto = chip("AUTO").apply { setOnClickListener { wbAuto() } }
         tvLock = chip("BLOCCATO").apply { setOnClickListener { wbLockBtn = true; updateWbUi(); update() } }
+        topChips.add(tvAuto)
+        topChips.add(tvLock)
         wrow.addView(tvAuto, LinearLayout.LayoutParams(WC, WC).apply { marginStart = dp(8) })
         wrow.addView(tvLock)
         root.addView(wrow, LinearLayout.LayoutParams(MP, WC))
@@ -629,6 +642,7 @@ class MainActivity : Activity() {
         root.addView(bar, LinearLayout.LayoutParams(MP, WC))
 
         setContentView(root)
+        root.post { fitHeader() }
         applySide()
         styleIso()
         updateWbUi()
@@ -636,6 +650,18 @@ class MainActivity : Activity() {
         onExp(0.5f)
         onFocus(0f)
         zoomOffR.run()
+    }
+
+    /** Calcola un'unica dimensione del testo per le due righe in alto, così stanno sempre nello schermo. */
+    private fun fitHeader() {
+        val avail = hdrV.width - hdrV.paddingLeft - hdrV.paddingRight - dp(34)
+        if (avail <= 0) return
+        val m = Paint(Paint.ANTI_ALIAS_FLAG).apply { typeface = Typeface.DEFAULT_BOLD; textSize = 100f }
+        var total = 0f
+        for (w in arrayOf("ISO:", "50", "100", "200", "400", "AUTO", "MACRO", "1:10000")) total += m.measureText(w) / 100f
+        val pads = dp(8) * 8 + dp(8)
+        val px = ((avail - pads) / total).coerceIn(dpf(9), dpf(13))
+        for (t in topChips) t.setTextSize(TypedValue.COMPLEX_UNIT_PX, px)
     }
 
     private fun setSide(s: String) {
@@ -1118,35 +1144,58 @@ class MainActivity : Activity() {
     // Scatto vocale: di' «clic»
     // =====================================================================
     private val recListener = object : RecognitionListener {
-        override fun onReadyForSpeech(p: Bundle?) {}
+        override fun onReadyForSpeech(p: Bundle?) { voiceStatus = "in ascolto" }
         override fun onBeginningOfSpeech() {}
         override fun onRmsChanged(v: Float) {}
         override fun onBufferReceived(b: ByteArray?) {}
         override fun onEndOfSpeech() {}
         override fun onError(e: Int) {
             if (!voiceOn) return
-            if (e == SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS) {
+            voiceStatus = "errore $e"
+            if (e == 9) {
                 setVoice(false)
                 toast("Serve il permesso del microfono")
                 return
             }
-            ui.postDelayed({ listenOnce() }, if (e == SpeechRecognizer.ERROR_RECOGNIZER_BUSY) 1000L else 250L)
+            if (e != 6 && e != 7 && e != 8) voiceNote(errText(e))
+            ui.postDelayed({ listenOnce() }, if (e == 8) 1000L else if (e == 6 || e == 7) 250L else 1500L)
         }
         override fun onResults(r: Bundle?) {
-            if (!heard(r) && voiceOn) ui.postDelayed({ listenOnce() }, 100)
+            val l = r?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+            if (!heard(r)) {
+                if (!l.isNullOrEmpty()) voiceNote("Ho sentito: «" + l[0] + "»")
+                if (voiceOn) ui.postDelayed({ listenOnce() }, 100)
+            }
         }
         override fun onPartialResults(r: Bundle?) { heard(r) }
         override fun onEvent(t: Int, p: Bundle?) {}
     }
 
-    /** true se ha sentito «clic»: scatta e riavvia l'ascolto. */
+    private fun errText(e: Int) = when (e) {
+        1, 2 -> "Voce: manca la connessione internet"
+        3 -> "Voce: errore del microfono"
+        4, 11 -> "Voce: il servizio non risponde"
+        5 -> "Voce: errore interno"
+        10 -> "Voce: troppe richieste"
+        12, 13 -> "Voce: lingua italiana non disponibile"
+        else -> "Voce: errore $e"
+    }
+
+    private fun voiceNote(t: String) {
+        val n = System.currentTimeMillis()
+        if (n - lastNote < 2500) return
+        lastNote = n
+        toast(t)
+    }
+
+    private val clicRe = Regex("\\b(cl|kl)i[a-z]{0,3}\\b")
+
+    /** true se ha sentito «clic» (o «click», «clip»…): scatta e riavvia l'ascolto. */
     private fun heard(r: Bundle?): Boolean {
         val l = r?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION) ?: return false
-        val hit = l.any {
-            val s = it.lowercase(Locale.ROOT)
-            s.contains("clic") || s.contains("clik") || s.contains("klik")
-        }
+        val hit = l.any { clicRe.containsMatchIn(it.lowercase(Locale.ROOT)) }
         if (hit) {
+            voiceStatus = "«clic» sentito"
             shoot()
             try { sr?.cancel() } catch (e: Exception) {}
             ui.postDelayed({ listenOnce() }, 1500)
@@ -1161,10 +1210,9 @@ class MainActivity : Activity() {
             .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
             .putExtra(RecognizerIntent.EXTRA_LANGUAGE, "it-IT")
             .putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-            .putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
-            .putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
+            .putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5)
             .putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, packageName)
-        try { s.startListening(i) } catch (e: Exception) {}
+        try { s.startListening(i) } catch (e: Exception) { voiceStatus = "avvio non riuscito" }
     }
 
     private fun startVoice() {
@@ -1178,6 +1226,7 @@ class MainActivity : Activity() {
             requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 2)
             return
         }
+        voiceStatus = "avvio"
         sr = SpeechRecognizer.createSpeechRecognizer(this).also { it.setRecognitionListener(recListener) }
         muteBeep(true)
         listenOnce()
@@ -1267,7 +1316,8 @@ class MainActivity : Activity() {
 
         box.addView(label("DIAGNOSTICA"))
         box.addView(TextView(this).apply {
-            text = if (diag.isEmpty()) "Fotocamera non ancora aperta" else diag
+            text = (if (diag.isEmpty()) "Fotocamera non ancora aperta" else diag) +
+                "\nScatto vocale: " + (if (voiceOn) voiceStatus.ifEmpty { "attivo" } else "spento")
             setTextColor(0xFFCCCCCC.toInt()); textSize = 12f
         })
     }
