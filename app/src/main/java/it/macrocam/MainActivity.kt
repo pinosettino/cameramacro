@@ -16,6 +16,7 @@ import android.graphics.Color
 import android.graphics.CornerPathEffect
 import android.graphics.ImageFormat
 import android.graphics.LinearGradient
+import android.graphics.Outline
 import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.Path
@@ -386,6 +387,18 @@ class MainActivity : Activity() {
     private var voiceOn = false
     private var sr: SpeechRecognizer? = null
     private var voiceStatus = ""
+    private var vSessions = 0
+    private var vLastErr = 0
+    private var vLastText = ""
+    private var vLastPartial = ""
+    @Volatile private var vRms = -2f
+    private var voiceDiagTv: TextView? = null
+    private val diagTick = object : Runnable {
+        override fun run() {
+            refreshVoiceDiag()
+            if (dlg?.isShowing == true) ui.postDelayed(this, 300)
+        }
+    }
     private var lastNote = 0L
 
     private val oriL by lazy {
@@ -620,12 +633,19 @@ class MainActivity : Activity() {
         pile.addView(back, FrameLayout.LayoutParams(dp(50), dp(50), Gravity.BOTTOM or Gravity.START))
         thumbV = ImageView(this).apply {
             scaleType = ImageView.ScaleType.CENTER_CROP
-            background = GradientDrawable().apply { cornerRadius = dpf(8); setColor(0xFF1C1C1E.toInt()); setStroke(dp(2), Color.WHITE) }
+            setBackgroundColor(0xFF1C1C1E.toInt())
             clipToOutline = true
-            outlineProvider = ViewOutlineProvider.BACKGROUND
+            outlineProvider = object : ViewOutlineProvider() {
+                override fun getOutline(v: View, o: Outline) { o.setRoundRect(0, 0, v.width, v.height, dpf(6)) }
+            }
+        }
+        val frame = FrameLayout(this).apply {
+            background = GradientDrawable().apply { cornerRadius = dpf(8); setColor(Color.WHITE) }
+            setPadding(dp(2), dp(2), dp(2), dp(2))
             setOnClickListener { lastUri?.let { u -> openPhoto(u) } }
         }
-        pile.addView(thumbV, FrameLayout.LayoutParams(dp(50), dp(50), Gravity.TOP or Gravity.END))
+        frame.addView(thumbV, FrameLayout.LayoutParams(MP, MP))
+        pile.addView(frame, FrameLayout.LayoutParams(dp(50), dp(50), Gravity.TOP or Gravity.END))
         val leftBox = FrameLayout(this)
         leftBox.addView(pile, FrameLayout.LayoutParams(dp(62), dp(62), Gravity.CENTER_VERTICAL or Gravity.START))
         bar.addView(leftBox, LinearLayout.LayoutParams(0, dp(80), 1f))
@@ -1144,12 +1164,13 @@ class MainActivity : Activity() {
     // Scatto vocale: di' «clic»
     // =====================================================================
     private val recListener = object : RecognitionListener {
-        override fun onReadyForSpeech(p: Bundle?) { voiceStatus = "in ascolto" }
+        override fun onReadyForSpeech(p: Bundle?) { voiceStatus = "in ascolto"; vSessions++ }
         override fun onBeginningOfSpeech() {}
-        override fun onRmsChanged(v: Float) {}
+        override fun onRmsChanged(v: Float) { vRms = v }
         override fun onBufferReceived(b: ByteArray?) {}
         override fun onEndOfSpeech() {}
         override fun onError(e: Int) {
+            vLastErr = e
             if (!voiceOn) return
             voiceStatus = "errore $e"
             if (e == 9) {
@@ -1162,13 +1183,47 @@ class MainActivity : Activity() {
         }
         override fun onResults(r: Bundle?) {
             val l = r?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+            if (!l.isNullOrEmpty()) vLastText = l.joinToString(" | ")
             if (!heard(r)) {
                 if (!l.isNullOrEmpty()) voiceNote("Ho sentito: «" + l[0] + "»")
                 if (voiceOn) ui.postDelayed({ listenOnce() }, 100)
             }
         }
-        override fun onPartialResults(r: Bundle?) { heard(r) }
+        override fun onPartialResults(r: Bundle?) {
+            r?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()?.let { vLastPartial = it }
+            heard(r)
+        }
         override fun onEvent(t: Int, p: Bundle?) {}
+    }
+
+    private fun errName(e: Int) = when (e) {
+        0 -> "nessuno"
+        1 -> "rete, tempo scaduto (1)"
+        2 -> "rete (2)"
+        3 -> "audio (3)"
+        4 -> "server (4)"
+        5 -> "interno (5)"
+        6 -> "nessun parlato rilevato (6)"
+        7 -> "parlato non riconosciuto (7)"
+        8 -> "servizio occupato (8)"
+        9 -> "permessi (9)"
+        10 -> "troppe richieste (10)"
+        11 -> "server scollegato (11)"
+        12 -> "lingua non supportata (12)"
+        13 -> "lingua non disponibile (13)"
+        else -> "codice $e"
+    }
+
+    private fun refreshVoiceDiag() {
+        val t = voiceDiagTv ?: return
+        val lvl = ((vRms + 2f) / 12f * 10f).roundToInt().coerceIn(0, 10)
+        val bar = "█".repeat(lvl) + "░".repeat(10 - lvl)
+        t.text = "Scatto vocale: " + (if (voiceOn) voiceStatus.ifEmpty { "attivo" } else "spento") +
+            "\nMicrofono: " + bar +
+            "\nSessioni di ascolto: " + vSessions +
+            "\nUltimo errore: " + errName(vLastErr) +
+            "\nSentito (parziale): «" + vLastPartial + "»" +
+            "\nSentito (finale): «" + vLastText + "»"
     }
 
     private fun errText(e: Int) = when (e) {
@@ -1265,7 +1320,10 @@ class MainActivity : Activity() {
             .setView(ScrollView(this).apply { addView(box) })
             .setPositiveButton("Chiudi", null)
             .create()
+        dlg!!.setOnDismissListener { ui.removeCallbacks(diagTick) }
         dlg!!.show()
+        ui.removeCallbacks(diagTick)
+        ui.post(diagTick)
     }
 
     private fun fillSettings(box: LinearLayout) {
@@ -1316,10 +1374,14 @@ class MainActivity : Activity() {
 
         box.addView(label("DIAGNOSTICA"))
         box.addView(TextView(this).apply {
-            text = (if (diag.isEmpty()) "Fotocamera non ancora aperta" else diag) +
-                "\nScatto vocale: " + (if (voiceOn) voiceStatus.ifEmpty { "attivo" } else "spento")
+            text = if (diag.isEmpty()) "Fotocamera non ancora aperta" else diag
             setTextColor(0xFFCCCCCC.toInt()); textSize = 12f
         })
+        voiceDiagTv = TextView(this).apply {
+            setTextColor(0xFFCCCCCC.toInt()); textSize = 12f; setPadding(0, dp(8), 0, 0)
+        }
+        box.addView(voiceDiagTv)
+        refreshVoiceDiag()
     }
 
     private fun pickFolder() {
