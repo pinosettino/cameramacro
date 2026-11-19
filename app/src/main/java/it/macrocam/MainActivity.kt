@@ -388,6 +388,11 @@ class MainActivity : Activity() {
     private var sr: SpeechRecognizer? = null
     private var voiceStatus = ""
     private var vSessions = 0
+    private var vHits = 0
+    private var vRecreated = 0
+    @Volatile private var vLastEvent = 0L
+    @Volatile private var vShot = "nessuno"
+    private var busySince = 0L
     private var vLastErr = 0
     private var vLastText = ""
     private var vLastPartial = ""
@@ -1040,8 +1045,14 @@ class MainActivity : Activity() {
     // Scatto e salvataggio
     // =====================================================================
     private fun shoot() {
-        if (busy || session == null || cam == null) return
+        if (busy && System.currentTimeMillis() - busySince > 6000) busy = false
+        if (busy || session == null || cam == null) {
+            vShot = "ignorato (già in corso: $busy, sessione: ${session != null}, camera: ${cam != null})"
+            return
+        }
         busy = true
+        busySince = System.currentTimeMillis()
+        vShot = "avviato"
         flashV.alpha = 0.7f
         flashV.animate().alpha(0f).setDuration(250).start()
         bg?.post { waitLens(0) }
@@ -1063,19 +1074,25 @@ class MainActivity : Activity() {
             lastJpegOri = (sensorOri + devOri) % 360
             b.set(CaptureRequest.JPEG_ORIENTATION, lastJpegOri)
             s.capture(b.build(), object : CameraCaptureSession.CaptureCallback() {
+                override fun onCaptureCompleted(s: CameraCaptureSession, r: CaptureRequest, res: TotalCaptureResult) {
+                    vShot = "scatto eseguito, salvo…"
+                }
                 override fun onCaptureFailed(s: CameraCaptureSession, r: CaptureRequest, f: CaptureFailure) {
                     busy = false
+                    vShot = "scatto fallito"
                     toast("Scatto non riuscito")
                 }
             }, bg)
         } catch (e: Exception) {
             busy = false
+            vShot = "errore: ${e.message}"
             toast("Scatto: ${e.message}")
         }
     }
 
     private fun onImage(r: ImageReader) {
-        val img = r.acquireNextImage() ?: return
+        val img = r.acquireNextImage()
+        if (img == null) { vShot = "immagine nulla"; busy = false; return }
         val buf = img.planes[0].buffer
         val bytes = ByteArray(buf.remaining())
         buf.get(bytes)
@@ -1083,6 +1100,7 @@ class MainActivity : Activity() {
         val ori = lastJpegOri
         val uri = try { saveJpeg(bytes) } catch (e: Exception) { null }
         val th = makeThumb(bytes, ori)
+        vShot = if (uri == null) "salvataggio fallito" else "foto salvata"
         runOnUiThread {
             busy = false
             if (uri == null) toast("Salvataggio non riuscito") else {
@@ -1164,13 +1182,14 @@ class MainActivity : Activity() {
     // Scatto vocale: di' «clic»
     // =====================================================================
     private val recListener = object : RecognitionListener {
-        override fun onReadyForSpeech(p: Bundle?) { voiceStatus = "in ascolto"; vSessions++ }
+        override fun onReadyForSpeech(p: Bundle?) { voiceStatus = "in ascolto"; vSessions++; vLastEvent = System.currentTimeMillis() }
         override fun onBeginningOfSpeech() {}
-        override fun onRmsChanged(v: Float) { vRms = v }
+        override fun onRmsChanged(v: Float) { vRms = v; vLastEvent = System.currentTimeMillis() }
         override fun onBufferReceived(b: ByteArray?) {}
         override fun onEndOfSpeech() {}
         override fun onError(e: Int) {
             vLastErr = e
+            vLastEvent = System.currentTimeMillis()
             if (!voiceOn) return
             voiceStatus = "errore $e"
             if (e == 9) {
@@ -1179,10 +1198,12 @@ class MainActivity : Activity() {
                 return
             }
             if (e != 6 && e != 7 && e != 8) voiceNote(errText(e))
-            ui.postDelayed({ listenOnce() }, if (e == 8) 1000L else if (e == 6 || e == 7) 250L else 1500L)
+            ui.postDelayed({ if (e == 4 || e == 5 || e == 11) recreateVoice() else listenOnce() },
+                if (e == 8) 1000L else if (e == 6 || e == 7) 250L else 1500L)
         }
         override fun onResults(r: Bundle?) {
             val l = r?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+            vLastEvent = System.currentTimeMillis()
             if (!l.isNullOrEmpty()) vLastText = l.joinToString(" | ")
             if (!heard(r)) {
                 if (!l.isNullOrEmpty()) voiceNote("Ho sentito: «" + l[0] + "»")
@@ -1190,6 +1211,7 @@ class MainActivity : Activity() {
             }
         }
         override fun onPartialResults(r: Bundle?) {
+            vLastEvent = System.currentTimeMillis()
             r?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()?.let { vLastPartial = it }
             heard(r)
         }
@@ -1221,6 +1243,8 @@ class MainActivity : Activity() {
         t.text = "Scatto vocale: " + (if (voiceOn) voiceStatus.ifEmpty { "attivo" } else "spento") +
             "\nMicrofono: " + bar +
             "\nSessioni di ascolto: " + vSessions +
+            "\n«clic» riconosciuti: " + vHits + "  ·  riavvii: " + vRecreated +
+            "\nUltimo scatto: " + vShot +
             "\nUltimo errore: " + errName(vLastErr) +
             "\nSentito (parziale): «" + vLastPartial + "»" +
             "\nSentito (finale): «" + vLastText + "»"
@@ -1251,9 +1275,10 @@ class MainActivity : Activity() {
         val hit = l.any { clicRe.containsMatchIn(it.lowercase(Locale.ROOT)) }
         if (hit) {
             voiceStatus = "«clic» sentito"
+            vHits++
             shoot()
             try { sr?.cancel() } catch (e: Exception) {}
-            ui.postDelayed({ listenOnce() }, 1500)
+            ui.postDelayed({ recreateVoice() }, 1500)
         }
         return hit
     }
@@ -1261,6 +1286,7 @@ class MainActivity : Activity() {
     private fun listenOnce() {
         if (!voiceOn) return
         val s = sr ?: return
+        vLastEvent = System.currentTimeMillis()
         val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
             .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
             .putExtra(RecognizerIntent.EXTRA_LANGUAGE, "it-IT")
@@ -1268,6 +1294,24 @@ class MainActivity : Activity() {
             .putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5)
             .putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, packageName)
         try { s.startListening(i) } catch (e: Exception) { voiceStatus = "avvio non riuscito" }
+    }
+
+    /** Distrugge e ricrea il riconoscitore: il servizio di Google a volte si blocca dopo molti riavvii. */
+    private fun recreateVoice() {
+        if (!voiceOn) return
+        try { sr?.cancel(); sr?.destroy() } catch (e: Exception) {}
+        sr = SpeechRecognizer.createSpeechRecognizer(this).also { it.setRecognitionListener(recListener) }
+        vRecreated++
+        voiceStatus = "riavviato"
+        listenOnce()
+    }
+
+    /** Se per 10 secondi non arriva nessun evento dal riconoscitore, lo ricrea. */
+    private val voiceWatch = object : Runnable {
+        override fun run() {
+            if (voiceOn && sr != null && System.currentTimeMillis() - vLastEvent > 10_000) recreateVoice()
+            if (voiceOn) ui.postDelayed(this, 4000)
+        }
     }
 
     private fun startVoice() {
@@ -1285,10 +1329,13 @@ class MainActivity : Activity() {
         sr = SpeechRecognizer.createSpeechRecognizer(this).also { it.setRecognitionListener(recListener) }
         muteBeep(true)
         listenOnce()
+        ui.removeCallbacks(voiceWatch)
+        ui.postDelayed(voiceWatch, 4000)
         toast("Scatto vocale attivo: di' «clic»")
     }
 
     private fun stopVoice() {
+        ui.removeCallbacks(voiceWatch)
         try { sr?.cancel(); sr?.destroy() } catch (e: Exception) {}
         sr = null
         muteBeep(false)
