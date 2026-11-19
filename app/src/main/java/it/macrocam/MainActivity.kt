@@ -13,11 +13,15 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.CornerPathEffect
 import android.graphics.ImageFormat
+import android.graphics.LinearGradient
 import android.graphics.Matrix
 import android.graphics.Paint
+import android.graphics.Path
 import android.graphics.PointF
 import android.graphics.Rect
+import android.graphics.Shader
 import android.graphics.SurfaceTexture
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
@@ -30,6 +34,9 @@ import android.hardware.camera2.CaptureFailure
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.CaptureResult
 import android.hardware.camera2.TotalCaptureResult
+import android.hardware.camera2.params.ColorSpaceTransform
+import android.hardware.camera2.params.RggbChannelVector
+import android.media.AudioManager
 import android.media.ImageReader
 import android.net.Uri
 import android.os.Build
@@ -40,6 +47,9 @@ import android.os.HandlerThread
 import android.os.Looper
 import android.provider.DocumentsContract
 import android.provider.MediaStore
+import android.speech.RecognitionListener
+import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
 import android.util.Size
 import android.view.Gravity
 import android.view.MotionEvent
@@ -68,21 +78,20 @@ import kotlin.math.roundToInt
 
 private const val MP = ViewGroup.LayoutParams.MATCH_PARENT
 private const val WC = ViewGroup.LayoutParams.WRAP_CONTENT
-private val YEL = 0xFFFFD60A.toInt()
-private val DARK = 0xFF2A2A2E.toInt()
+private val GREEN = 0xFF1FE01F.toInt()
 
-/** Slider verticale (fuoco o esposizione). f = 0 in alto, 1 in basso. */
-class VSlider(c: Context, private val thumbR: Float, private val inThumb: Boolean) : View(c) {
+/** Slider verticale. f = 0 in alto, 1 in basso. shutterLook = aspetto da pulsante di scatto (fuoco). */
+class VSlider(c: Context, private val thumbR: Float, private val shutterLook: Boolean) : View(c) {
     var f = 0f
     var label = ""
     var labelRight = true
-    var topText = ""
-    var botText = ""
+    var snap = 0f
     var onChange: (Float) -> Unit = {}
+    var onTap: () -> Unit = {}
     var onDouble: () -> Unit = {}
 
     private val d = c.resources.displayMetrics.density
-    private val padV get() = thumbR + 16 * d
+    private val padV get() = thumbR + 6 * d
     private val p = Paint(Paint.ANTI_ALIAS_FLAG)
     private var rel = false
     private var onThumb = false
@@ -93,48 +102,46 @@ class VSlider(c: Context, private val thumbR: Float, private val inThumb: Boolea
 
     private fun ty() = padV + f * (height - 2 * padV)
 
+    private fun setFrom(v: Float) {
+        var n = v.coerceIn(0f, 1f)
+        if (snap > 0f && abs(n - 0.5f) < snap) n = 0.5f
+        f = n
+    }
+
     override fun onDraw(cv: Canvas) {
         val x = width / 2f
         val y = ty()
         p.style = Paint.Style.STROKE
-        p.strokeWidth = 5 * d
+        p.strokeWidth = 4 * d
         p.strokeCap = Paint.Cap.ROUND
-        p.color = 0x99FFFFFF.toInt()
+        p.color = 0x80FFFFFF.toInt()
         cv.drawLine(x, padV, x, height - padV, p)
 
         p.style = Paint.Style.FILL
-        p.color = if (inThumb) 0xE6FFFFFF.toInt() else YEL
-        cv.drawCircle(x, y, thumbR, p)
-        p.style = Paint.Style.STROKE
-        p.strokeWidth = 3 * d
-        p.color = Color.WHITE
-        cv.drawCircle(x, y, thumbR, p)
-
-        p.style = Paint.Style.FILL
-        if (inThumb) {
+        if (shutterLook) {
+            p.color = Color.BLACK; cv.drawCircle(x, y, thumbR, p)
+            p.color = Color.WHITE; cv.drawCircle(x, y, thumbR * 0.88f, p)
+            p.color = Color.BLACK; cv.drawCircle(x, y, thumbR * 0.70f, p)
+            p.color = Color.WHITE; cv.drawCircle(x, y, thumbR * 0.63f, p)
+            if (label.isNotEmpty()) {
+                p.textSize = 13 * d
+                p.textAlign = Paint.Align.LEFT
+                val tw = p.measureText(label)
+                val m = 8 * d
+                val left = if (labelRight) x + thumbR + 6 * d else x - thumbR - 6 * d - tw - 2 * m
+                p.color = 0xB3000000.toInt()
+                cv.drawRoundRect(left, y - 13 * d, left + tw + 2 * m, y + 13 * d, 10 * d, 10 * d, p)
+                p.color = Color.WHITE
+                cv.drawText(label, left + m, y + 5 * d, p)
+            }
+        } else {
+            p.color = Color.BLACK; cv.drawCircle(x, y, thumbR, p)
+            p.color = Color.WHITE; cv.drawCircle(x, y, thumbR - 3.5f * d, p)
             p.textSize = 13 * d
             p.textAlign = Paint.Align.CENTER
-            p.color = 0xFF222222.toInt()
+            p.color = Color.BLACK
             cv.drawText(label, x, y + p.textSize / 3, p)
-        } else if (label.isNotEmpty()) {
-            p.textSize = 13 * d
-            p.textAlign = Paint.Align.LEFT
-            val tw = p.measureText(label)
-            val m = 8 * d
-            val left = if (labelRight) x + thumbR + 6 * d else x - thumbR - 6 * d - tw - 2 * m
-            p.color = 0xB3000000.toInt()
-            cv.drawRoundRect(left, y - 13 * d, left + tw + 2 * m, y + 13 * d, 10 * d, 10 * d, p)
-            p.color = Color.WHITE
-            cv.drawText(label, left + m, y + 5 * d, p)
         }
-
-        p.textSize = 10 * d
-        p.textAlign = Paint.Align.CENTER
-        p.color = Color.WHITE
-        p.setShadowLayer(3 * d, 0f, 1f, Color.BLACK)
-        cv.drawText(topText, x, 11 * d, p)
-        cv.drawText(botText, x, height - 4 * d, p)
-        p.clearShadowLayer()
     }
 
     override fun onTouchEvent(e: MotionEvent): Boolean {
@@ -142,13 +149,13 @@ class VSlider(c: Context, private val thumbR: Float, private val inThumb: Boolea
         when (e.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 parent.requestDisallowInterceptTouchEvent(true)
-                onThumb = abs(e.y - ty()) <= thumbR * 1.3f
+                onThumb = abs(e.y - ty()) <= thumbR * 1.2f
                 rel = onThumb
                 y0 = e.y
                 f0 = f
                 moved = false
                 if (!rel) {
-                    f = ((e.y - padV) / span).coerceIn(0f, 1f)
+                    setFrom((e.y - padV) / span)
                     onChange(f)
                     invalidate()
                 }
@@ -157,19 +164,68 @@ class VSlider(c: Context, private val thumbR: Float, private val inThumb: Boolea
                 if (rel) {
                     if (!moved && abs(e.y - y0) < 8 * d) return true
                     moved = true
-                    f = (f0 + (e.y - y0) / span).coerceIn(0f, 1f)
+                    setFrom(f0 + (e.y - y0) / span)
                 } else {
-                    f = ((e.y - padV) / span).coerceIn(0f, 1f)
+                    setFrom((e.y - padV) / span)
                 }
                 onChange(f)
                 invalidate()
             }
             MotionEvent.ACTION_UP -> {
                 if (onThumb && !moved) {
+                    onTap()
                     val n = System.currentTimeMillis()
                     if (n - lastTap < 400) onDouble()
                     lastTap = n
                 }
+            }
+        }
+        return true
+    }
+}
+
+/** Barra orizzontale del bilanciamento del bianco, con calamita al centro. */
+class HSlider(c: Context) : View(c) {
+    var f = 0.5f
+    var onChange: (Float) -> Unit = {}
+
+    private val d = c.resources.displayMetrics.density
+    private val padH get() = 14 * d
+    private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+    private var shader: Shader? = null
+
+    override fun onSizeChanged(w: Int, h: Int, ow: Int, oh: Int) {
+        shader = LinearGradient(
+            padH, 0f, w - padH, 0f,
+            intArrayOf(0xFF5B8DFF.toInt(), Color.WHITE, 0xFFFFC21A.toInt()),
+            floatArrayOf(0f, 0.5f, 1f), Shader.TileMode.CLAMP
+        )
+    }
+
+    override fun onDraw(cv: Canvas) {
+        val cy = height / 2f
+        p.style = Paint.Style.FILL
+        p.shader = shader
+        cv.drawRoundRect(padH, cy - 4 * d, width - padH, cy + 4 * d, 4 * d, 4 * d, p)
+        p.shader = null
+        val x = padH + f * (width - 2 * padH)
+        p.color = Color.WHITE
+        cv.drawRoundRect(x - 5 * d, cy - 16 * d, x + 5 * d, cy + 16 * d, 3 * d, 3 * d, p)
+        p.style = Paint.Style.STROKE
+        p.strokeWidth = 1.5f * d
+        p.color = Color.BLACK
+        cv.drawRoundRect(x - 5 * d, cy - 16 * d, x + 5 * d, cy + 16 * d, 3 * d, 3 * d, p)
+    }
+
+    override fun onTouchEvent(e: MotionEvent): Boolean {
+        when (e.actionMasked) {
+            MotionEvent.ACTION_DOWN, MotionEvent.ACTION_MOVE -> {
+                parent.requestDisallowInterceptTouchEvent(true)
+                var n = ((e.x - padH) / max(1f, width - 2 * padH)).coerceIn(0f, 1f)
+                if (abs(n - 0.5f) < 0.05f) n = 0.5f
+                f = n
+                onChange(f)
+                invalidate()
             }
         }
         return true
@@ -224,6 +280,27 @@ class Shutter(c: Context) : View(c) {
     override fun performClick(): Boolean = super.performClick()
 }
 
+/** Triangolino bianco (nessuno stato attivo). */
+class Tri(c: Context, private val left: Boolean) : View(c) {
+    private val p = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.WHITE
+        pathEffect = CornerPathEffect(5f * c.resources.displayMetrics.density)
+    }
+
+    override fun onDraw(cv: Canvas) {
+        val w = width.toFloat()
+        val h = height.toFloat()
+        val path = Path()
+        if (left) {
+            path.moveTo(w * 0.78f, h * 0.18f); path.lineTo(w * 0.20f, h * 0.5f); path.lineTo(w * 0.78f, h * 0.82f)
+        } else {
+            path.moveTo(w * 0.22f, h * 0.18f); path.lineTo(w * 0.80f, h * 0.5f); path.lineTo(w * 0.22f, h * 0.82f)
+        }
+        path.close()
+        cv.drawPath(path, p)
+    }
+}
+
 class MainActivity : Activity() {
 
     // ---- UI ----
@@ -233,13 +310,15 @@ class MainActivity : Activity() {
     private lateinit var pt: View
     private lateinit var sl: VSlider
     private lateinit var ex: VSlider
+    private lateinit var wb: HSlider
     private lateinit var msgV: TextView
     private lateinit var flashV: View
     private lateinit var promptV: LinearLayout
     private lateinit var thumbV: ImageView
     private lateinit var tvTime: TextView
-    private lateinit var arrL: TextView
-    private lateinit var arrR: TextView
+    private lateinit var tvMacro: TextView
+    private lateinit var tvAuto: TextView
+    private lateinit var tvLock: TextView
     private val isoBtns = ArrayList<TextView>()
     private val ui = Handler(Looper.getMainLooper())
     private var settingsBox: LinearLayout? = null
@@ -252,8 +331,8 @@ class MainActivity : Activity() {
     private var session: CameraCaptureSession? = null
     private var reader: ImageReader? = null
     private var pSurface: Surface? = null
-    private var sessTex: SurfaceTexture? = null
-    private var opening = false
+    @Volatile private var opening = false
+    @Volatile private var creating = false
     private var camId = ""
     private var sensorOri = 90
     private var arr = Rect()
@@ -262,6 +341,8 @@ class MainActivity : Activity() {
     private var minFocus = 0f
     private var manualFocus = false
     private var manualOk = false
+    private var wbOk = false
+    private var awbLockOk = false
     private var isoMin = 0
     private var isoMax = 0
     private var expMin = 0L
@@ -274,6 +355,7 @@ class MainActivity : Activity() {
     private var diag = ""
 
     // ---- stato ----
+    private var macroOn = true
     private var focusD = 0f
     private var isoVal = 0
     private var t0 = 10_000_000.0
@@ -281,7 +363,12 @@ class MainActivity : Activity() {
     private var zoomed = false
     private var zoomF = 5
     private val P = PointF(0.5f, 0.5f)
+    private var wbShift = 0f
+    private var wbLockBtn = false
 
+    @Volatile private var baseG: RggbChannelVector? = null
+    @Volatile private var baseT: ColorSpaceTransform? = null
+    @Volatile private var usedManual = false
     @Volatile private var lastExp = 10_000_000L
     @Volatile private var lastIso = 100
     @Volatile private var lensMoving = false
@@ -291,6 +378,10 @@ class MainActivity : Activity() {
     private var lastJpegOri = 0
     private var lastUri: Uri? = null
     private var lblT = 0L
+
+    // ---- voce ----
+    private var voiceOn = false
+    private var sr: SpeechRecognizer? = null
 
     private val oriL by lazy {
         object : OrientationEventListener(this) {
@@ -314,6 +405,7 @@ class MainActivity : Activity() {
         super.onCreate(b)
         prefs = getSharedPreferences("macro", MODE_PRIVATE)
         zoomF = prefs.getInt("z", 5)
+        voiceOn = prefs.getBoolean("voice", false)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         window.statusBarColor = Color.BLACK
         window.navigationBarColor = Color.BLACK
@@ -327,9 +419,11 @@ class MainActivity : Activity() {
         bg = Handler(bgT!!.looper)
         oriL.enable()
         if (tv.isAvailable) openCamera()
+        if (voiceOn) startVoice()
     }
 
     override fun onPause() {
+        stopVoice()
         oriL.disable()
         ui.removeCallbacks(zoomOffR)
         closeCamera()
@@ -351,6 +445,11 @@ class MainActivity : Activity() {
 
     override fun onRequestPermissionsResult(rc: Int, p: Array<out String>, r: IntArray) {
         super.onRequestPermissionsResult(rc, p, r)
+        if (rc == 2) {
+            if (r.isNotEmpty() && r[0] == PackageManager.PERMISSION_GRANTED) startVoice()
+            else { setVoice(false); toast("Serve il permesso del microfono") }
+            return
+        }
         if (checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
             if (tv.isAvailable) openCamera()
         } else toast("Serve il permesso della fotocamera")
@@ -359,44 +458,56 @@ class MainActivity : Activity() {
     // =====================================================================
     // Interfaccia
     // =====================================================================
-    private fun circle(color: Int) = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(color) }
+    private fun chip(t: String) = TextView(this).apply {
+        text = t
+        textSize = 13f
+        typeface = Typeface.DEFAULT_BOLD
+        setTextColor(Color.WHITE)
+        gravity = Gravity.CENTER
+        maxLines = 1
+        setPadding(dp(4), dp(8), dp(4), dp(8))
+    }
 
     private fun buildUi() {
         val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setBackgroundColor(Color.BLACK) }
 
-        // --- barra alta: impostazioni, ISO, tempo ---
+        // --- riga 1: impostazioni, ISO, MACRO, tempo ---
         val hdr = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(4), dp(4), dp(8), dp(4))
+            setPadding(dp(6), dp(2), dp(8), 0)
         }
         val gear = TextView(this).apply {
-            text = "⚙"; textSize = 22f; setTextColor(Color.WHITE); gravity = Gravity.CENTER
+            text = "⚙"; textSize = 24f; setTextColor(0xFFB4B4B8.toInt()); gravity = Gravity.CENTER
             setOnClickListener { showSettings() }
         }
-        hdr.addView(gear, LinearLayout.LayoutParams(dp(36), dp(40)))
-        hdr.addView(TextView(this).apply {
-            text = "ISO"; setTextColor(Color.WHITE); textSize = 11f; typeface = Typeface.DEFAULT_BOLD
-        }, LinearLayout.LayoutParams(WC, WC).apply { marginStart = dp(2) })
+        hdr.addView(gear, LinearLayout.LayoutParams(dp(34), dp(40)))
+        hdr.addView(chip("ISO:").apply { setPadding(dp(2), dp(8), dp(4), dp(8)) })
         for (i in intArrayOf(50, 100, 200, 400, 0)) {
-            val t = TextView(this).apply {
-                text = if (i == 0) "AUTO" else "$i"
-                textSize = 11f
-                gravity = Gravity.CENTER
-                typeface = Typeface.DEFAULT_BOLD
-                setPadding(dp(6), dp(6), dp(6), dp(6))
-                tag = i
-                setOnClickListener { setIso(i) }
-            }
+            val t = chip(if (i == 0) "AUTO" else "$i").apply { tag = i; setOnClickListener { setIso(i) } }
             isoBtns.add(t)
-            hdr.addView(t, LinearLayout.LayoutParams(WC, WC).apply { marginStart = dp(3) })
+            hdr.addView(t)
         }
-        tvTime = TextView(this).apply {
-            text = "1:—"; textSize = 13f; setTextColor(Color.WHITE); typeface = Typeface.DEFAULT_BOLD
-            gravity = Gravity.END; maxLines = 1; setSingleLine(true); setPadding(dp(4), 0, 0, 0)
-        }
+        tvMacro = chip("MACRO").apply { setOnClickListener { setMacro(!macroOn) } }
+        hdr.addView(tvMacro, LinearLayout.LayoutParams(WC, WC).apply { marginStart = dp(8) })
+        tvTime = chip("1:—").apply { gravity = Gravity.END }
         hdr.addView(tvTime, LinearLayout.LayoutParams(0, WC, 1f))
         root.addView(hdr, LinearLayout.LayoutParams(MP, WC))
+
+        // --- riga 2: bilanciamento del bianco ---
+        val wrow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(6), 0, dp(8), dp(2))
+        }
+        wb = HSlider(this)
+        wb.onChange = { f -> onWb(f) }
+        wrow.addView(wb, LinearLayout.LayoutParams(0, dp(40), 1f))
+        tvAuto = chip("AUTO").apply { setOnClickListener { wbAuto() } }
+        tvLock = chip("BLOCCATO").apply { setOnClickListener { wbLockBtn = true; updateWbUi(); update() } }
+        wrow.addView(tvAuto, LinearLayout.LayoutParams(WC, WC).apply { marginStart = dp(8) })
+        wrow.addView(tvLock)
+        root.addView(wrow, LinearLayout.LayoutParams(MP, WC))
 
         // --- area anteprima ---
         stage = FrameLayout(this).apply { clipChildren = false; setBackgroundColor(Color.BLACK) }
@@ -405,7 +516,9 @@ class MainActivity : Activity() {
             override fun onSurfaceTextureAvailable(s: SurfaceTexture, w: Int, h: Int) {
                 if (cam != null) createSession() else openCamera()
             }
-            override fun onSurfaceTextureSizeChanged(s: SurfaceTexture, w: Int, h: Int) {}
+            override fun onSurfaceTextureSizeChanged(s: SurfaceTexture, w: Int, h: Int) {
+                if (cam != null && session == null) createSession()
+            }
             override fun onSurfaceTextureDestroyed(s: SurfaceTexture): Boolean = true
             override fun onSurfaceTextureUpdated(s: SurfaceTexture) {}
         }
@@ -415,8 +528,8 @@ class MainActivity : Activity() {
         pt = View(this).apply {
             background = GradientDrawable().apply {
                 shape = GradientDrawable.OVAL
-                setStroke(dp(2), YEL)
-                setColor(0x22FFD60A)
+                setStroke(dp(3), Color.BLACK)
+                setColor(0x55FFFFFF)
             }
         }
         stage.addView(pt, FrameLayout.LayoutParams(dp(46), dp(46), Gravity.TOP or Gravity.START))
@@ -437,11 +550,12 @@ class MainActivity : Activity() {
             }
         }
 
-        sl = VSlider(this, dpf(27), false)
-        ex = VSlider(this, dpf(22), true)
+        sl = VSlider(this, dpf(30), true)
+        ex = VSlider(this, dpf(25), false)
         ex.f = 0.5f
-        sl.topText = "100 cm"
+        ex.snap = 0.045f
         sl.onChange = { f -> onFocus(f) }
+        sl.onTap = { shoot() }
         ex.onChange = { f -> onExp(f) }
         ex.onDouble = { ex.f = 0.5f; onExp(0.5f); ex.invalidate() }
         stage.addView(sl)
@@ -461,48 +575,55 @@ class MainActivity : Activity() {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             visibility = View.GONE
-            setPadding(dp(14), dp(6), dp(6), dp(6))
+            setPadding(dp(16), dp(4), dp(4), dp(4))
             background = GradientDrawable().apply { cornerRadius = dpf(22); setColor(0xF01C1C1E.toInt()) }
         }
         promptV.addView(TextView(this).apply { text = "Foto salvata"; setTextColor(Color.WHITE); textSize = 14f })
-        promptV.addView(Button(this).apply {
-            text = "Apri in Google Foto"; isAllCaps = false; setTextColor(Color.BLACK)
-            background = GradientDrawable().apply { cornerRadius = dpf(18); setColor(YEL) }
-            setPadding(dp(14), 0, dp(14), 0)
+        promptV.addView(TextView(this).apply {
+            text = "Apri in Google Foto"; setTextColor(GREEN); textSize = 14f; typeface = Typeface.DEFAULT_BOLD
+            gravity = Gravity.CENTER
+            setPadding(dp(14), dp(10), dp(8), dp(10))
             setOnClickListener { lastUri?.let { u -> openPhoto(u) }; promptV.visibility = View.GONE }
-        }, LinearLayout.LayoutParams(WC, dp(38)).apply { marginStart = dp(12) })
+        })
         promptV.addView(TextView(this).apply {
             text = "✕"; setTextColor(Color.WHITE); textSize = 16f; gravity = Gravity.CENTER
             setOnClickListener { promptV.visibility = View.GONE }
-        }, LinearLayout.LayoutParams(dp(40), dp(38)))
+        }, LinearLayout.LayoutParams(dp(40), dp(40)))
         stage.addView(promptV, FrameLayout.LayoutParams(WC, WC, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply { bottomMargin = dp(12) })
 
         root.addView(stage, LinearLayout.LayoutParams(MP, 0, 1f))
 
-        // --- barra bassa: miniatura, frecce, scatto ---
+        // --- barra bassa: miniatura, triangoli, scatto ---
         val bar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             setPadding(dp(14), dp(8), dp(14), dp(14))
         }
+        val pile = FrameLayout(this)
+        val back = View(this).apply {
+            rotation = -9f
+            background = GradientDrawable().apply { cornerRadius = dpf(8); setColor(0xFF0B0B0B.toInt()); setStroke(dp(2), Color.WHITE) }
+        }
+        pile.addView(back, FrameLayout.LayoutParams(dp(50), dp(50), Gravity.BOTTOM or Gravity.START))
         thumbV = ImageView(this).apply {
             scaleType = ImageView.ScaleType.CENTER_CROP
-            background = GradientDrawable().apply { cornerRadius = dpf(10); setColor(0xFF1C1C1E.toInt()); setStroke(dp(2), 0xFF444448.toInt()) }
+            background = GradientDrawable().apply { cornerRadius = dpf(8); setColor(0xFF1C1C1E.toInt()); setStroke(dp(2), Color.WHITE) }
             clipToOutline = true
             outlineProvider = ViewOutlineProvider.BACKGROUND
             setOnClickListener { lastUri?.let { u -> openPhoto(u) } }
         }
-        val left = FrameLayout(this)
-        left.addView(thumbV, FrameLayout.LayoutParams(dp(56), dp(56), Gravity.CENTER_VERTICAL or Gravity.START))
-        bar.addView(left, LinearLayout.LayoutParams(0, dp(80), 1f))
+        pile.addView(thumbV, FrameLayout.LayoutParams(dp(50), dp(50), Gravity.TOP or Gravity.END))
+        val leftBox = FrameLayout(this)
+        leftBox.addView(pile, FrameLayout.LayoutParams(dp(62), dp(62), Gravity.CENTER_VERTICAL or Gravity.START))
+        bar.addView(leftBox, LinearLayout.LayoutParams(0, dp(80), 1f))
 
-        arrL = arrow("◀", "l")
-        arrR = arrow("▶", "r")
+        val triL = Tri(this, true).apply { setOnClickListener { setSide("l") } }
+        val triR = Tri(this, false).apply { setOnClickListener { setSide("r") } }
         val shutter = Shutter(this).apply { setOnClickListener { shoot() } }
         val center = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER }
-        center.addView(arrL, LinearLayout.LayoutParams(dp(46), dp(46)))
-        center.addView(shutter, LinearLayout.LayoutParams(dp(76), dp(76)).apply { marginStart = dp(16); marginEnd = dp(16) })
-        center.addView(arrR, LinearLayout.LayoutParams(dp(46), dp(46)))
+        center.addView(triL, LinearLayout.LayoutParams(dp(40), dp(48)))
+        center.addView(shutter, LinearLayout.LayoutParams(dp(76), dp(76)).apply { marginStart = dp(18); marginEnd = dp(18) })
+        center.addView(triR, LinearLayout.LayoutParams(dp(40), dp(48)))
         bar.addView(center, LinearLayout.LayoutParams(WC, dp(80)))
         bar.addView(View(this), LinearLayout.LayoutParams(0, dp(80), 1f))
         root.addView(bar, LinearLayout.LayoutParams(MP, WC))
@@ -510,14 +631,16 @@ class MainActivity : Activity() {
         setContentView(root)
         applySide()
         styleIso()
+        updateWbUi()
+        setMacro(true)
         onExp(0.5f)
         onFocus(0f)
         zoomOffR.run()
     }
 
-    private fun arrow(t: String, side: String) = TextView(this).apply {
-        text = t; textSize = 16f; gravity = Gravity.CENTER
-        setOnClickListener { prefs.edit().putString("side", side).apply(); applySide() }
+    private fun setSide(s: String) {
+        prefs.edit().putString("side", s).apply()
+        applySide()
     }
 
     private fun applySide() {
@@ -529,25 +652,28 @@ class MainActivity : Activity() {
         sl.layoutParams = lp(64, 70)
         ex.layoutParams = lp(52, 8)
         sl.labelRight = left
-        arrL.background = circle(if (left) YEL else DARK)
-        arrR.background = circle(if (left) DARK else YEL)
-        arrL.setTextColor(if (left) Color.BLACK else Color.WHITE)
-        arrR.setTextColor(if (left) Color.WHITE else Color.BLACK)
         sl.invalidate()
     }
 
     private fun styleIso() {
         for (t in isoBtns) {
             val i = t.tag as Int
-            val on = i == isoVal
-            val ok = i == 0 || isoOk(i)
-            t.background = GradientDrawable().apply { cornerRadius = dpf(14); setColor(if (on) YEL else DARK) }
-            t.setTextColor(if (on) Color.BLACK else Color.WHITE)
-            t.alpha = if (ok) 1f else 0.3f
+            t.setTextColor(if (i == isoVal) GREEN else Color.WHITE)
+            t.alpha = if (i == 0 || isoOk(i)) 1f else 0.3f
         }
     }
 
     private fun isoOk(i: Int) = manualOk && i in isoMin..isoMax
+
+    private fun setMacro(on: Boolean) {
+        macroOn = on
+        tvMacro.setTextColor(if (on) GREEN else Color.WHITE)
+        sl.visibility = if (on) View.VISIBLE else View.GONE
+        pt.visibility = if (on) View.VISIBLE else View.INVISIBLE
+        if (!on) { ui.removeCallbacks(zoomOffR); zoomed = false }
+        placePt()
+        update()
+    }
 
     private fun placePt() {
         if (!::pt.isInitialized || !::tv.isInitialized) return
@@ -582,7 +708,7 @@ class MainActivity : Activity() {
     }
 
     // =====================================================================
-    // Controlli: fuoco, esposizione, ISO
+    // Controlli: fuoco, esposizione, ISO, bianco
     // =====================================================================
     private fun onFocus(f: Float) {
         focusD = if (manualFocus) 1f + f * (minFocus - 1f) else 0f
@@ -594,7 +720,7 @@ class MainActivity : Activity() {
             }
         }
         sl.invalidate()
-        zoomOn()
+        if (macroOn) zoomOn()
         update()
     }
 
@@ -625,7 +751,6 @@ class MainActivity : Activity() {
     private fun setIso(i: Int) {
         if (i != 0 && !isoOk(i)) return
         if (i != 0) {
-            // tempo equivalente all'esposizione automatica attuale, al nuovo ISO
             val t = lastExp.toDouble() * lastIso / i
             t0 = if (expMax > expMin) t.coerceIn(expMin.toDouble(), expMax.toDouble()) else t
         }
@@ -634,6 +759,33 @@ class MainActivity : Activity() {
         if (i == 0) tvTime.text = "1:—"
         onExp(0.5f)
         styleIso()
+    }
+
+    private fun onWb(f: Float) {
+        if (!wbOk) {
+            wb.f = 0.5f
+            wb.invalidate()
+            toast("Questo telefono non permette di regolare il bianco")
+            return
+        }
+        wbShift = (f - 0.5f) * 2f
+        updateWbUi()
+        update()
+    }
+
+    private fun wbAuto() {
+        wbLockBtn = false
+        wbShift = 0f
+        wb.f = 0.5f
+        wb.invalidate()
+        updateWbUi()
+        update()
+    }
+
+    private fun updateWbUi() {
+        val locked = wbLockBtn || wbShift != 0f
+        tvLock.setTextColor(if (locked) GREEN else Color.WHITE)
+        tvAuto.setTextColor(if (locked) Color.WHITE else GREEN)
     }
 
     // =====================================================================
@@ -654,9 +806,9 @@ class MainActivity : Activity() {
             opening = true
             mgr.openCamera(camId, object : CameraDevice.StateCallback() {
                 override fun onOpened(d: CameraDevice) { cam = d; opening = false; createSession() }
-                override fun onDisconnected(d: CameraDevice) { d.close(); cam = null; session = null; sessTex = null; opening = false }
+                override fun onDisconnected(d: CameraDevice) { d.close(); cam = null; session = null; opening = false }
                 override fun onError(d: CameraDevice, err: Int) {
-                    d.close(); cam = null; session = null; sessTex = null; opening = false
+                    d.close(); cam = null; session = null; opening = false
                     toast("Errore fotocamera ($err)")
                 }
             }, bg)
@@ -680,6 +832,8 @@ class MainActivity : Activity() {
         manualFocus = minFocus > 1f
         val caps = ch.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
         manualOk = caps?.contains(CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR) == true
+        wbOk = caps?.contains(CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_POST_PROCESSING) == true
+        awbLockOk = ch.get(CameraCharacteristics.CONTROL_AWB_LOCK_AVAILABLE) == true
         ch.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)?.let { isoMin = it.lower; isoMax = it.upper }
         ch.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)?.let { expMin = it.lower; expMax = it.upper }
         aeStep = ch.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_STEP)?.toFloat() ?: 0f
@@ -698,12 +852,12 @@ class MainActivity : Activity() {
             "Foto: ${jpeg.width}×${jpeg.height}  ·  anteprima ${prev.width}×${prev.height}\n" +
             "Fuoco manuale: " + (if (manualFocus) "sì, minimo " + String.format(Locale.US, "%.1f", 100f / minFocus) + " cm" else "NO (resta autofocus)") + "\n" +
             "ISO manuale: " + (if (manualOk) "sì ($isoMin–$isoMax)" else "NO") + "\n" +
-            "Compensazione EV: " + String.format(Locale.US, "%.1f…%.1f", aeMin, aeMax)
+            "Compensazione EV: " + String.format(Locale.US, "%.1f…%.1f", aeMin, aeMax) + "\n" +
+            "Bianco manuale: " + (if (wbOk) "sì" else "NO") + "  ·  blocco bianco: " + (if (awbLockOk) "sì" else "NO")
 
         runOnUiThread {
             tv.setAspect(prev.height, prev.width)
-            sl.botText = if (manualFocus) String.format(Locale.US, "%.0f cm", 100f / minFocus) else ""
-            sl.invalidate()
+            wb.alpha = if (wbOk) 1f else 0.35f
             styleIso()
             onFocus(sl.f)
             onExp(ex.f)
@@ -713,11 +867,9 @@ class MainActivity : Activity() {
 
     private fun createSession() {
         val c = cam ?: return
+        if (session != null || creating) return
         val st = tv.surfaceTexture ?: return
-        if (sessTex === st) return          // già costruita (o in costruzione) su questa superficie
-        try { session?.close() } catch (e: Exception) {}
-        session = null
-        sessTex = st
+        creating = true
         try {
             st.setDefaultBufferSize(prev.width, prev.height)
             val ps = Surface(st)
@@ -728,11 +880,11 @@ class MainActivity : Activity() {
             reader = r
             @Suppress("DEPRECATION")
             c.createCaptureSession(listOf(ps, r.surface), object : CameraCaptureSession.StateCallback() {
-                override fun onConfigured(s: CameraCaptureSession) { session = s; update() }
-                override fun onConfigureFailed(s: CameraCaptureSession) { sessTex = null; toast("Sessione fotocamera non riuscita") }
+                override fun onConfigured(s: CameraCaptureSession) { session = s; creating = false; update() }
+                override fun onConfigureFailed(s: CameraCaptureSession) { creating = false; toast("Sessione fotocamera non riuscita") }
             }, bg)
         } catch (e: Exception) {
-            sessTex = null
+            creating = false
             toast("Sessione: ${e.message}")
         }
     }
@@ -745,11 +897,11 @@ class MainActivity : Activity() {
         try { reader?.close() } catch (e: Exception) {}
         reader = null
         pSurface = null
-        sessTex = null
         opening = false
+        creating = false
     }
 
-    // (cx, cy) dello schermo -> coordinate normalizzate del sensore
+    // coordinate dello schermo (0..1) -> coordinate normalizzate del sensore
     private fun toSensor(dx: Float, dy: Float): Pair<Float, Float> = when (sensorOri) {
         90 -> Pair(dy, 1f - dx)
         180 -> Pair(1f - dx, 1f - dy)
@@ -768,7 +920,7 @@ class MainActivity : Activity() {
 
     private fun fill(b: CaptureRequest.Builder, zoom: Boolean) {
         b.set(CaptureRequest.CONTROL_MODE, CameraMetadata.CONTROL_MODE_AUTO)
-        if (manualFocus) {
+        if (macroOn && manualFocus) {
             b.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_OFF)
             b.set(CaptureRequest.LENS_FOCUS_DISTANCE, focusD)
         } else {
@@ -783,7 +935,22 @@ class MainActivity : Activity() {
             b.set(CaptureRequest.SENSOR_SENSITIVITY, isoVal)
             b.set(CaptureRequest.SENSOR_EXPOSURE_TIME, curTimeNs())
         }
-        if (zoom) b.set(CaptureRequest.SCALER_CROP_REGION, cropFor(zoomF))
+        // bilanciamento del bianco
+        val g = baseG
+        val t = baseT
+        if (wbOk && wbShift != 0f && g != null && t != null) {
+            usedManual = true
+            val w = 1.6.pow(wbShift.toDouble()).toFloat()
+            b.set(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_OFF)
+            b.set(CaptureRequest.COLOR_CORRECTION_MODE, CameraMetadata.COLOR_CORRECTION_MODE_TRANSFORM_MATRIX)
+            b.set(CaptureRequest.COLOR_CORRECTION_GAINS, RggbChannelVector(g.red * w, g.greenEven, g.greenOdd, g.blue / w))
+            b.set(CaptureRequest.COLOR_CORRECTION_TRANSFORM, t)
+        } else {
+            usedManual = false
+            b.set(CaptureRequest.CONTROL_AWB_MODE, CameraMetadata.CONTROL_AWB_MODE_AUTO)
+            if (wbLockBtn && awbLockOk) b.set(CaptureRequest.CONTROL_AWB_LOCK, true)
+        }
+        if (zoom && macroOn) b.set(CaptureRequest.SCALER_CROP_REGION, cropFor(zoomF))
     }
 
     private val prevCb = object : CameraCaptureSession.CaptureCallback() {
@@ -791,6 +958,10 @@ class MainActivity : Activity() {
             lensMoving = res.get(CaptureResult.LENS_STATE) == CameraMetadata.LENS_STATE_MOVING
             res.get(CaptureResult.SENSOR_EXPOSURE_TIME)?.let { lastExp = it }
             res.get(CaptureResult.SENSOR_SENSITIVITY)?.let { lastIso = it }
+            if (!usedManual) {
+                res.get(CaptureResult.COLOR_CORRECTION_GAINS)?.let { baseG = it }
+                res.get(CaptureResult.COLOR_CORRECTION_TRANSFORM)?.let { baseT = it }
+            }
             val n = System.currentTimeMillis()
             if (isoVal == 0 && n - lblT > 400) {
                 lblT = n
@@ -890,7 +1061,6 @@ class MainActivity : Activity() {
     private fun saveJpeg(bytes: ByteArray): Uri? {
         val name = "MACRO_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date()) + ".jpg"
 
-        // cartella scelta dall'utente
         val tree = prefs.getString("tree", null)
         if (tree != null) {
             try {
@@ -906,7 +1076,6 @@ class MainActivity : Activity() {
             }
         }
 
-        // cartella predefinita: Pictures/Macro
         if (Build.VERSION.SDK_INT >= 29) {
             val cv = ContentValues().apply {
                 put(MediaStore.MediaColumns.DISPLAY_NAME, name)
@@ -946,6 +1115,97 @@ class MainActivity : Activity() {
     }
 
     // =====================================================================
+    // Scatto vocale: di' «clic»
+    // =====================================================================
+    private val recListener = object : RecognitionListener {
+        override fun onReadyForSpeech(p: Bundle?) {}
+        override fun onBeginningOfSpeech() {}
+        override fun onRmsChanged(v: Float) {}
+        override fun onBufferReceived(b: ByteArray?) {}
+        override fun onEndOfSpeech() {}
+        override fun onError(e: Int) {
+            if (!voiceOn) return
+            if (e == SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS) {
+                setVoice(false)
+                toast("Serve il permesso del microfono")
+                return
+            }
+            ui.postDelayed({ listenOnce() }, if (e == SpeechRecognizer.ERROR_RECOGNIZER_BUSY) 1000L else 250L)
+        }
+        override fun onResults(r: Bundle?) {
+            if (!heard(r) && voiceOn) ui.postDelayed({ listenOnce() }, 100)
+        }
+        override fun onPartialResults(r: Bundle?) { heard(r) }
+        override fun onEvent(t: Int, p: Bundle?) {}
+    }
+
+    /** true se ha sentito «clic»: scatta e riavvia l'ascolto. */
+    private fun heard(r: Bundle?): Boolean {
+        val l = r?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION) ?: return false
+        val hit = l.any {
+            val s = it.lowercase(Locale.ROOT)
+            s.contains("clic") || s.contains("clik") || s.contains("klik")
+        }
+        if (hit) {
+            shoot()
+            try { sr?.cancel() } catch (e: Exception) {}
+            ui.postDelayed({ listenOnce() }, 1500)
+        }
+        return hit
+    }
+
+    private fun listenOnce() {
+        if (!voiceOn) return
+        val s = sr ?: return
+        val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+            .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            .putExtra(RecognizerIntent.EXTRA_LANGUAGE, "it-IT")
+            .putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+            .putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
+            .putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
+            .putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, packageName)
+        try { s.startListening(i) } catch (e: Exception) {}
+    }
+
+    private fun startVoice() {
+        if (!voiceOn || sr != null) return
+        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+            setVoice(false)
+            toast("Riconoscimento vocale non disponibile su questo telefono")
+            return
+        }
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 2)
+            return
+        }
+        sr = SpeechRecognizer.createSpeechRecognizer(this).also { it.setRecognitionListener(recListener) }
+        muteBeep(true)
+        listenOnce()
+        toast("Scatto vocale attivo: di' «clic»")
+    }
+
+    private fun stopVoice() {
+        try { sr?.cancel(); sr?.destroy() } catch (e: Exception) {}
+        sr = null
+        muteBeep(false)
+    }
+
+    private fun setVoice(on: Boolean) {
+        voiceOn = on
+        prefs.edit().putBoolean("voice", on).apply()
+        if (on) startVoice() else stopVoice()
+        if (dlg?.isShowing == true) settingsBox?.let { fillSettings(it) }
+    }
+
+    /** Silenzia il "din" che il riconoscimento vocale emette a ogni ascolto. */
+    private fun muteBeep(on: Boolean) {
+        val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        for (s in intArrayOf(AudioManager.STREAM_NOTIFICATION, AudioManager.STREAM_SYSTEM, AudioManager.STREAM_MUSIC)) {
+            try { am.adjustStreamVolume(s, if (on) AudioManager.ADJUST_MUTE else AudioManager.ADJUST_UNMUTE, 0) } catch (e: Exception) {}
+        }
+    }
+
+    // =====================================================================
     // Impostazioni
     // =====================================================================
     private fun showSettings() {
@@ -967,7 +1227,7 @@ class MainActivity : Activity() {
         fun btn(t: String, on: Boolean, f: () -> Unit) = Button(this).apply {
             text = t; isAllCaps = false
             setTextColor(if (on) Color.BLACK else Color.WHITE)
-            setBackgroundColor(if (on) YEL else 0xFF3A3A3E.toInt())
+            setBackgroundColor(if (on) GREEN else 0xFF3A3A3E.toInt())
             setOnClickListener { f() }
         }
         fun row(vararg v: View) = LinearLayout(this).apply {
@@ -992,6 +1252,11 @@ class MainActivity : Activity() {
             btn("3×", zoomF == 3) { zoomF = 3; prefs.edit().putInt("z", 3).apply(); fillSettings(box) },
             btn("5×", zoomF == 5) { zoomF = 5; prefs.edit().putInt("z", 5).apply(); fillSettings(box) },
             btn("8×", zoomF == 8) { zoomF = 8; prefs.edit().putInt("z", 8).apply(); fillSettings(box) }
+        ))
+
+        box.addView(label("SCATTO VOCALE"))
+        box.addView(row(
+            btn("Di' «clic» per scattare", voiceOn) { setVoice(!voiceOn) }
         ))
 
         box.addView(label("FORMATO"))
