@@ -26,10 +26,6 @@ import android.graphics.Shader
 import android.graphics.SurfaceTexture
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
-import android.hardware.Sensor
-import android.hardware.SensorEvent
-import android.hardware.SensorEventListener
-import android.hardware.SensorManager
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
@@ -89,7 +85,6 @@ import kotlin.math.sqrt
 private const val MP = ViewGroup.LayoutParams.MATCH_PARENT
 private const val WC = ViewGroup.LayoutParams.WRAP_CONTENT
 private val GREEN = 0xFF1FE01F.toInt()
-private val PEAK = 0xE61FE01F.toInt()
 
 /** Slider verticale. f = 0 in alto, 1 in basso. shutterLook = aspetto da pulsante di scatto (fuoco). */
 class VSlider(c: Context, private val thumbR: Float, private val shutterLook: Boolean) : View(c) {
@@ -334,30 +329,19 @@ open class AspectView(c: Context) : View(c) {
     }
 }
 
-/** Strato del focus peaking: punti verdi dove l'immagine è a fuoco. */
-class PeakView(c: Context) : AspectView(c) {
-    var bmp: Bitmap? = null
-    private val p = Paint().apply { isFilterBitmap = false }
-    private val dst = Rect()
-
-    override fun onDraw(cv: Canvas) {
-        val b = bmp ?: return
-        dst.set(0, 0, width, height)
-        cv.drawBitmap(b, null, dst, p)
-    }
-}
-
-/** Mirino al centro; senza zoom mostra anche il riquadro che verrà ingrandito. */
+/** Finestra mobile: mostra il riquadro che verrà ingrandito (si trascina); con lo zoom resta la crocetta al centro. */
 class Reticle(c: Context) : AspectView(c) {
     var win = 0f
+    var px = 0.5f
+    var py = 0.5f
     private val d = c.resources.displayMetrics.density
     private val p = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; strokeCap = Paint.Cap.ROUND }
 
     override fun onDraw(cv: Canvas) {
         val w = width.toFloat()
         val h = height.toFloat()
-        val cx = w / 2
-        val cy = h / 2
+        val cx = if (win > 0f) px * w else w / 2
+        val cy = if (win > 0f) py * h else h / 2
         for (pass in 0..1) {
             p.strokeWidth = if (pass == 0) 3.5f * d else 1.5f * d
             p.color = if (pass == 0) 0x99000000.toInt() else 0xCCFFFFFF.toInt()
@@ -374,7 +358,6 @@ class MainActivity : Activity() {
     private lateinit var prefs: SharedPreferences
     private lateinit var stage: FrameLayout
     private lateinit var tv: AutoTex
-    private lateinit var peak: PeakView
     private lateinit var reticle: Reticle
     private lateinit var sl: VSlider
     private lateinit var ex: VSlider
@@ -462,24 +445,6 @@ class MainActivity : Activity() {
     @Volatile private var nBase = 0f
     @Volatile private var nHits = 0
 
-    // ---- focus peaking (solo con zoom attivo e scena ferma) ----
-    private var peakRunning = false
-    private var sm: SensorManager? = null
-    private var gyroOk = false
-    @Volatile private var gAvg = 1f
-    @Volatile private var calmSince = 0L
-    private var pkBmp: Bitmap? = null
-    private var pkOut: Bitmap? = null
-    private var pkPix = IntArray(0)
-    private var pkLumA = IntArray(0)
-    private var pkLumB = IntArray(0)
-    private var pkGrad = IntArray(0)
-    private var pkMask = ByteArray(0)
-    private var pkCol = IntArray(0)
-    private val pkHist = IntArray(512)
-    private var pkHavePrev = false
-    private var pkFlip = false
-    private var peakStatus = "spento"
     private var sr: SpeechRecognizer? = null
     private var voiceStatus = ""
     private var vSessions = 0
@@ -509,7 +474,7 @@ class MainActivity : Activity() {
         }
     }
 
-    private val zoomOffR = Runnable { zoomed = false; stopPeak(); updateReticle(); update() }
+    private val zoomOffR = Runnable { zoomed = false; updateReticle(); update() }
     private val hideMsg = Runnable { msgV.visibility = View.GONE }
     private val hidePrompt = Runnable { promptV.visibility = View.GONE }
 
@@ -543,7 +508,6 @@ class MainActivity : Activity() {
 
     override fun onPause() {
         stopMic()
-        stopPeak()
         oriL.disable()
         ui.removeCallbacks(zoomOffR)
         closeCamera()
@@ -652,13 +616,28 @@ class MainActivity : Activity() {
         }
         stage.addView(tv, FrameLayout.LayoutParams(MP, MP, Gravity.CENTER))
 
-        peak = PeakView(this)
-        peak.visibility = View.INVISIBLE
-        stage.addView(peak, FrameLayout.LayoutParams(MP, MP, Gravity.CENTER))
         reticle = Reticle(this)
         stage.addView(reticle, FrameLayout.LayoutParams(MP, MP, Gravity.CENTER))
-        // con lo zoom attivo, un tocco sullo schermo lo toglie
-        stage.setOnClickListener { if (zoomed) zoomOffR.run() }
+        // senza zoom: si tocca o si trascina per spostare la finestra; con lo zoom attivo: un tocco lo toglie
+        var downZoomed = false
+        var dx0 = 0f
+        var dy0 = 0f
+        stage.setOnTouchListener { _, e ->
+            when (e.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    downZoomed = zoomed
+                    dx0 = e.x
+                    dy0 = e.y
+                    if (!zoomed) movePoint(e)
+                }
+                MotionEvent.ACTION_MOVE -> if (!zoomed && !downZoomed) movePoint(e)
+                MotionEvent.ACTION_UP -> {
+                    if (downZoomed && zoomed && abs(e.x - dx0) < dpf(24) && abs(e.y - dy0) < dpf(24)) zoomOffR.run()
+                    downZoomed = false
+                }
+            }
+            true
+        }
 
         sl = VSlider(this, dpf(30), true)
         ex = VSlider(this, dpf(25), false)
@@ -768,135 +747,6 @@ class MainActivity : Activity() {
         for (t in topChips) t.setTextSize(TypedValue.COMPLEX_UNIT_PX, px)
     }
 
-    private val gyroL = object : SensorEventListener {
-        override fun onSensorChanged(e: SensorEvent) {
-            val m = sqrt(e.values[0] * e.values[0] + e.values[1] * e.values[1] + e.values[2] * e.values[2])
-            gAvg = 0.85f * gAvg + 0.15f * m
-            if (gAvg > 0.10f) calmSince = 0L else if (calmSince == 0L) calmSince = System.currentTimeMillis()
-        }
-        override fun onAccuracyChanged(s: Sensor?, a: Int) {}
-    }
-
-    private val peakTick = object : Runnable {
-        override fun run() {
-            if (!(peakRunning && zoomed && macroOn)) { stopPeak(); return }
-            try { stepPeaking() } catch (e: Exception) { peakStatus = "errore" }
-            ui.postDelayed(this, 200)
-        }
-    }
-
-    private fun startPeak() {
-        if (peakRunning) return
-        peakRunning = true
-        pkHavePrev = false
-        val m = getSystemService(Context.SENSOR_SERVICE) as SensorManager
-        sm = m
-        val g = m.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
-        gyroOk = g != null
-        if (g != null) {
-            gAvg = 1f
-            calmSince = 0L
-            m.registerListener(gyroL, g, SensorManager.SENSOR_DELAY_GAME)
-        }
-        ui.removeCallbacks(peakTick)
-        ui.post(peakTick)
-    }
-
-    private fun stopPeak() {
-        peakRunning = false
-        ui.removeCallbacks(peakTick)
-        try { sm?.unregisterListener(gyroL) } catch (e: Exception) {}
-        if (::peak.isInitialized) peak.visibility = View.INVISIBLE
-        peakStatus = "spento"
-    }
-
-    private fun hidePeak(why: String) {
-        peakStatus = why
-        pkHavePrev = false
-        if (peak.visibility != View.INVISIBLE) peak.visibility = View.INVISIBLE
-    }
-
-    /**
-     * Un passo del peaking. I calcoli costosi partono solo se:
-     *  1) il giroscopio dice che il telefono è fermo da almeno 250 ms;
-     *  2) due immagini consecutive sono quasi uguali (soggetto fermo).
-     * Si illuminano solo i punti ad altissimo contrasto che formano gruppi.
-     */
-    private fun stepPeaking() {
-        val now = System.currentTimeMillis()
-        if (gyroOk && !(calmSince != 0L && now - calmSince >= 250)) { hidePeak("telefono in movimento (" + String.format(Locale.US, "%.2f", gAvg) + ")"); return }
-        if (!tv.isAvailable || tv.width < 8) return
-        val gw = 176
-        val gh = max(8, gw * tv.height / tv.width)
-        var b = pkBmp
-        if (b == null || b.width != gw || b.height != gh) {
-            b = Bitmap.createBitmap(gw, gh, Bitmap.Config.ARGB_8888)
-            pkBmp = b
-            pkOut = Bitmap.createBitmap(gw, gh, Bitmap.Config.ARGB_8888)
-            val n = gw * gh
-            pkPix = IntArray(n); pkLumA = IntArray(n); pkLumB = IntArray(n)
-            pkGrad = IntArray(n); pkMask = ByteArray(n); pkCol = IntArray(n)
-            pkHavePrev = false
-        }
-        tv.getBitmap(b)
-        b.getPixels(pkPix, 0, gw, 0, 0, gw, gh)
-        val cur = if (pkFlip) pkLumB else pkLumA
-        val old = if (pkFlip) pkLumA else pkLumB
-        pkFlip = !pkFlip
-        val n = gw * gh
-        for (i in 0 until n) {
-            val c = pkPix[i]
-            cur[i] = (((c shr 16) and 255) * 77 + ((c shr 8) and 255) * 150 + (c and 255) * 29) shr 8
-        }
-        if (!pkHavePrev) { pkHavePrev = true; peakStatus = "in attesa"; return }
-        var diff = 0L
-        for (i in 0 until n) diff += abs(cur[i] - old[i])
-        val dm = diff.toFloat() / n
-        if (dm > 6f) { hidePeak("scena in movimento (" + String.format(Locale.US, "%.1f", dm) + ")"); pkHavePrev = true; return }
-
-        // gradiente e soglia al 98° percentile
-        java.util.Arrays.fill(pkHist, 0)
-        for (y in 1 until gh - 1) {
-            val r = y * gw
-            for (x in 1 until gw - 1) {
-                val i = r + x
-                val v = abs(cur[i + 1] - cur[i - 1]) + abs(cur[i + gw] - cur[i - gw])
-                pkGrad[i] = v
-                pkHist[if (v > 511) 511 else v]++
-            }
-        }
-        val target = ((gw - 2) * (gh - 2) * 0.98f).toInt()
-        var acc = 0
-        var p98 = 0
-        for (k in 0 until 512) { acc += pkHist[k]; if (acc >= target) { p98 = k; break } }
-        val thr = max(60, (p98 * 0.6f).toInt())
-
-        java.util.Arrays.fill(pkMask, 0)
-        for (y in 1 until gh - 1) {
-            val r = y * gw
-            for (x in 1 until gw - 1) { val i = r + x; if (pkGrad[i] >= thr) pkMask[i] = 1 }
-        }
-        // tiene solo i punti con almeno 3 vicini accesi: gruppi, non puntini sparsi
-        java.util.Arrays.fill(pkCol, 0)
-        var lit = 0
-        for (y in 2 until gh - 2) {
-            val r = y * gw
-            for (x in 2 until gw - 2) {
-                val i = r + x
-                if (pkMask[i].toInt() == 1) {
-                    val nb = pkMask[i - 1] + pkMask[i + 1] + pkMask[i - gw] + pkMask[i + gw] +
-                        pkMask[i - gw - 1] + pkMask[i - gw + 1] + pkMask[i + gw - 1] + pkMask[i + gw + 1]
-                    if (nb >= 3) { pkCol[i] = PEAK; lit++ }
-                }
-            }
-        }
-        pkOut!!.setPixels(pkCol, 0, gw, 0, 0, gw, gh)
-        peak.bmp = pkOut
-        peak.invalidate()
-        if (peak.visibility != View.VISIBLE) peak.visibility = View.VISIBLE
-        peakStatus = "attivo ($lit punti)"
-    }
-
     private fun setSide(s: String) {
         prefs.edit().putString("side", s).apply()
         applySide()
@@ -928,7 +778,7 @@ class MainActivity : Activity() {
         macroOn = on
         tvMacro.setTextColor(if (on) GREEN else Color.WHITE)
         sl.visibility = if (on) View.VISIBLE else View.GONE
-        if (!on) { ui.removeCallbacks(zoomOffR); zoomed = false; stopPeak() }
+        if (!on) { ui.removeCallbacks(zoomOffR); zoomed = false }
         updateReticle()
         update()
     }
@@ -937,7 +787,24 @@ class MainActivity : Activity() {
         if (!::reticle.isInitialized) return
         reticle.visibility = if (macroOn) View.VISIBLE else View.INVISIBLE
         reticle.win = if (zoomed) 0f else 1f / zoomF
+        reticle.px = P.x
+        reticle.py = P.y
         reticle.invalidate()
+    }
+
+    /** Tiene la finestra dentro l'immagine. */
+    private fun clampP() {
+        val h = 0.5f / zoomF
+        P.x = P.x.coerceIn(h, 1f - h)
+        P.y = P.y.coerceIn(h, 1f - h)
+    }
+
+    private fun movePoint(e: MotionEvent) {
+        if (!macroOn || tv.width <= 0 || tv.height <= 0) return
+        P.x = (e.x - tv.left) / tv.width
+        P.y = (e.y - tv.top) / tv.height
+        clampP()
+        updateReticle()
     }
 
     private fun toast(t: String) {
@@ -976,7 +843,6 @@ class MainActivity : Activity() {
         zoomed = true
         ui.removeCallbacks(zoomOffR)
         updateReticle()
-        startPeak()
     }
 
     private fun onExp(f: Float) {
@@ -1105,7 +971,6 @@ class MainActivity : Activity() {
 
         runOnUiThread {
             tv.setAspect(prev.height, prev.width)
-            peak.setAspect(prev.height, prev.width)
             reticle.setAspect(prev.height, prev.width)
             wb.alpha = if (wbOk) 1f else 0.35f
             styleIso()
@@ -1437,7 +1302,6 @@ class MainActivity : Activity() {
 
     private fun refreshVoiceDiag() {
         val t = voiceDiagTv ?: return
-        val pk = "\nPeaking: " + peakStatus
         if (vmode == 2) {
             val lvl = ((nLevel / max(1f, nThr)) * 10f).roundToInt().coerceIn(0, 10)
             val bar = "█".repeat(lvl) + "░".repeat(10 - lvl)
@@ -1445,7 +1309,7 @@ class MainActivity : Activity() {
                 "\nLivello: " + bar + "  (pieno = scatta)" +
                 "\nSoglia: " + nThr.toInt() + "  ·  rumore di fondo: " + nBase.toInt() +
                 "\nScatti da rumore: " + nHits +
-                "\nUltimo scatto: " + vShot + pk
+                "\nUltimo scatto: " + vShot
             return
         }
         val lvl = ((vRms + 2f) / 12f * 10f).roundToInt().coerceIn(0, 10)
@@ -1457,7 +1321,7 @@ class MainActivity : Activity() {
             "\nUltimo scatto: " + vShot +
             "\nUltimo errore: " + errName(vLastErr) +
             "\nSentito (parziale): «" + vLastPartial + "»" +
-            "\nSentito (finale): «" + vLastText + "»" + pk
+            "\nSentito (finale): «" + vLastText + "»"
     }
 
     private fun errText(e: Int) = when (e) {
@@ -1693,9 +1557,9 @@ class MainActivity : Activity() {
 
         box.addView(label("INGRANDIMENTO MENTRE METTI A FUOCO"))
         box.addView(row(
-            btn("3×", zoomF == 3) { zoomF = 3; prefs.edit().putInt("z", 3).apply(); updateReticle(); fillSettings(box) },
-            btn("5×", zoomF == 5) { zoomF = 5; prefs.edit().putInt("z", 5).apply(); updateReticle(); fillSettings(box) },
-            btn("8×", zoomF == 8) { zoomF = 8; prefs.edit().putInt("z", 8).apply(); updateReticle(); fillSettings(box) }
+            btn("3×", zoomF == 3) { zoomF = 3; prefs.edit().putInt("z", 3).apply(); clampP(); updateReticle(); fillSettings(box) },
+            btn("5×", zoomF == 5) { zoomF = 5; prefs.edit().putInt("z", 5).apply(); clampP(); updateReticle(); fillSettings(box) },
+            btn("8×", zoomF == 8) { zoomF = 8; prefs.edit().putInt("z", 8).apply(); clampP(); updateReticle(); fillSettings(box) }
         ))
 
         box.addView(label("SCATTO A VOCE"))
