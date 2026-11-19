@@ -252,6 +252,7 @@ class MainActivity : Activity() {
     private var session: CameraCaptureSession? = null
     private var reader: ImageReader? = null
     private var pSurface: Surface? = null
+    private var sessTex: SurfaceTexture? = null
     private var opening = false
     private var camId = ""
     private var sensorOri = 90
@@ -367,32 +368,32 @@ class MainActivity : Activity() {
         val hdr = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(6), dp(4), dp(12), dp(4))
+            setPadding(dp(4), dp(4), dp(8), dp(4))
         }
         val gear = TextView(this).apply {
-            text = "⚙"; textSize = 24f; setTextColor(Color.WHITE); gravity = Gravity.CENTER
+            text = "⚙"; textSize = 22f; setTextColor(Color.WHITE); gravity = Gravity.CENTER
             setOnClickListener { showSettings() }
         }
-        hdr.addView(gear, LinearLayout.LayoutParams(dp(42), dp(42)))
+        hdr.addView(gear, LinearLayout.LayoutParams(dp(36), dp(40)))
         hdr.addView(TextView(this).apply {
-            text = "ISO"; setTextColor(Color.WHITE); textSize = 12f; typeface = Typeface.DEFAULT_BOLD
-        }, LinearLayout.LayoutParams(WC, WC).apply { marginStart = dp(4) })
+            text = "ISO"; setTextColor(Color.WHITE); textSize = 11f; typeface = Typeface.DEFAULT_BOLD
+        }, LinearLayout.LayoutParams(WC, WC).apply { marginStart = dp(2) })
         for (i in intArrayOf(50, 100, 200, 400, 0)) {
             val t = TextView(this).apply {
                 text = if (i == 0) "AUTO" else "$i"
-                textSize = 12f
+                textSize = 11f
                 gravity = Gravity.CENTER
                 typeface = Typeface.DEFAULT_BOLD
-                setPadding(dp(8), dp(6), dp(8), dp(6))
+                setPadding(dp(6), dp(6), dp(6), dp(6))
                 tag = i
                 setOnClickListener { setIso(i) }
             }
             isoBtns.add(t)
-            hdr.addView(t, LinearLayout.LayoutParams(WC, WC).apply { marginStart = dp(4) })
+            hdr.addView(t, LinearLayout.LayoutParams(WC, WC).apply { marginStart = dp(3) })
         }
         tvTime = TextView(this).apply {
-            text = "1:—"; textSize = 15f; setTextColor(Color.WHITE); typeface = Typeface.DEFAULT_BOLD
-            gravity = Gravity.END
+            text = "1:—"; textSize = 13f; setTextColor(Color.WHITE); typeface = Typeface.DEFAULT_BOLD
+            gravity = Gravity.END; maxLines = 1; setSingleLine(true); setPadding(dp(4), 0, 0, 0)
         }
         hdr.addView(tvTime, LinearLayout.LayoutParams(0, WC, 1f))
         root.addView(hdr, LinearLayout.LayoutParams(MP, WC))
@@ -438,6 +439,7 @@ class MainActivity : Activity() {
 
         sl = VSlider(this, dpf(27), false)
         ex = VSlider(this, dpf(22), true)
+        ex.f = 0.5f
         sl.topText = "100 cm"
         sl.onChange = { f -> onFocus(f) }
         ex.onChange = { f -> onExp(f) }
@@ -652,9 +654,9 @@ class MainActivity : Activity() {
             opening = true
             mgr.openCamera(camId, object : CameraDevice.StateCallback() {
                 override fun onOpened(d: CameraDevice) { cam = d; opening = false; createSession() }
-                override fun onDisconnected(d: CameraDevice) { d.close(); cam = null; session = null; opening = false }
+                override fun onDisconnected(d: CameraDevice) { d.close(); cam = null; session = null; sessTex = null; opening = false }
                 override fun onError(d: CameraDevice, err: Int) {
-                    d.close(); cam = null; session = null; opening = false
+                    d.close(); cam = null; session = null; sessTex = null; opening = false
                     toast("Errore fotocamera ($err)")
                 }
             }, bg)
@@ -711,8 +713,11 @@ class MainActivity : Activity() {
 
     private fun createSession() {
         val c = cam ?: return
-        if (session != null) return
         val st = tv.surfaceTexture ?: return
+        if (sessTex === st) return          // già costruita (o in costruzione) su questa superficie
+        try { session?.close() } catch (e: Exception) {}
+        session = null
+        sessTex = st
         try {
             st.setDefaultBufferSize(prev.width, prev.height)
             val ps = Surface(st)
@@ -724,9 +729,10 @@ class MainActivity : Activity() {
             @Suppress("DEPRECATION")
             c.createCaptureSession(listOf(ps, r.surface), object : CameraCaptureSession.StateCallback() {
                 override fun onConfigured(s: CameraCaptureSession) { session = s; update() }
-                override fun onConfigureFailed(s: CameraCaptureSession) { toast("Sessione fotocamera non riuscita") }
+                override fun onConfigureFailed(s: CameraCaptureSession) { sessTex = null; toast("Sessione fotocamera non riuscita") }
             }, bg)
         } catch (e: Exception) {
+            sessTex = null
             toast("Sessione: ${e.message}")
         }
     }
@@ -739,6 +745,7 @@ class MainActivity : Activity() {
         try { reader?.close() } catch (e: Exception) {}
         reader = null
         pSurface = null
+        sessTex = null
         opening = false
     }
 
