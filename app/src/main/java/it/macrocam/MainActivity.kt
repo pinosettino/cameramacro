@@ -352,6 +352,16 @@ class Reticle(c: Context) : AspectView(c) {
     }
 }
 
+/** Contenitore dell'anteprima: se il tocco inizia sulla finestra mobile, la finestra vince sui selettori. */
+class Stage(c: Context) : FrameLayout(c) {
+    var grab: (MotionEvent) -> Boolean = { false }
+
+    override fun onInterceptTouchEvent(e: MotionEvent): Boolean {
+        if (e.actionMasked == MotionEvent.ACTION_DOWN && grab(e)) return true
+        return super.onInterceptTouchEvent(e)
+    }
+}
+
 class MainActivity : Activity() {
 
     // ---- UI ----
@@ -602,7 +612,7 @@ class MainActivity : Activity() {
         root.addView(wrow, LinearLayout.LayoutParams(MP, WC))
 
         // --- area anteprima ---
-        stage = FrameLayout(this).apply { clipChildren = false; setBackgroundColor(Color.BLACK) }
+        stage = Stage(this).apply { clipChildren = false; setBackgroundColor(Color.BLACK); grab = { e -> windowHit(e) } }
         tv = AutoTex(this)
         tv.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
             override fun onSurfaceTextureAvailable(s: SurfaceTexture, w: Int, h: Int) {
@@ -616,8 +626,6 @@ class MainActivity : Activity() {
         }
         stage.addView(tv, FrameLayout.LayoutParams(MP, MP, Gravity.CENTER))
 
-        reticle = Reticle(this)
-        stage.addView(reticle, FrameLayout.LayoutParams(MP, MP, Gravity.CENTER))
         // senza zoom: si tocca o si trascina per spostare la finestra; con lo zoom attivo: un tocco lo toglie
         var downZoomed = false
         var dx0 = 0f
@@ -628,7 +636,7 @@ class MainActivity : Activity() {
                     downZoomed = zoomed
                     dx0 = e.x
                     dy0 = e.y
-                    if (!zoomed) movePoint(e)
+                    if (!zoomed) { grabOffset(e); movePoint(e) }
                 }
                 MotionEvent.ACTION_MOVE -> if (!zoomed && !downZoomed) movePoint(e)
                 MotionEvent.ACTION_UP -> {
@@ -649,6 +657,8 @@ class MainActivity : Activity() {
         ex.onDouble = { ex.f = 0.5f; onExp(0.5f); ex.invalidate() }
         stage.addView(sl)
         stage.addView(ex)
+        reticle = Reticle(this)
+        stage.addView(reticle, FrameLayout.LayoutParams(MP, MP, Gravity.CENTER))
 
         msgV = TextView(this).apply {
             setTextColor(Color.WHITE); textSize = 13f; visibility = View.GONE
@@ -799,10 +809,35 @@ class MainActivity : Activity() {
         P.y = P.y.coerceIn(h, 1f - h)
     }
 
+    private var offX = 0f
+    private var offY = 0f
+
+    /** true se il tocco cade sulla finestra mobile (con un po' di margine). */
+    private fun windowHit(e: MotionEvent): Boolean {
+        if (zoomed || !macroOn || !::tv.isInitialized || tv.width <= 0 || tv.height <= 0) return false
+        val cx = tv.left + P.x * tv.width
+        val cy = tv.top + P.y * tv.height
+        val hw = tv.width / zoomF / 2f + dpf(14)
+        val hh = tv.height / zoomF / 2f + dpf(14)
+        return abs(e.x - cx) <= hw && abs(e.y - cy) <= hh
+    }
+
+    /** Se si afferra la finestra, la si sposta senza farla saltare; altrimenti salta dove si tocca. */
+    private fun grabOffset(e: MotionEvent) {
+        if (tv.width <= 0 || tv.height <= 0) return
+        if (windowHit(e)) {
+            offX = P.x - (e.x - tv.left) / tv.width
+            offY = P.y - (e.y - tv.top) / tv.height
+        } else {
+            offX = 0f
+            offY = 0f
+        }
+    }
+
     private fun movePoint(e: MotionEvent) {
         if (!macroOn || tv.width <= 0 || tv.height <= 0) return
-        P.x = (e.x - tv.left) / tv.width
-        P.y = (e.y - tv.top) / tv.height
+        P.x = (e.x - tv.left) / tv.width + offX
+        P.y = (e.y - tv.top) / tv.height + offY
         clampP()
         updateReticle()
     }
