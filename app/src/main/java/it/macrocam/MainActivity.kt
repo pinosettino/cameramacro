@@ -26,6 +26,10 @@ import android.graphics.Shader
 import android.graphics.SurfaceTexture
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
@@ -37,8 +41,11 @@ import android.hardware.camera2.CaptureResult
 import android.hardware.camera2.TotalCaptureResult
 import android.hardware.camera2.params.ColorSpaceTransform
 import android.hardware.camera2.params.RggbChannelVector
+import android.media.AudioFormat
 import android.media.AudioManager
+import android.media.AudioRecord
 import android.media.ImageReader
+import android.media.MediaRecorder
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -77,10 +84,12 @@ import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.pow
 import kotlin.math.roundToInt
+import kotlin.math.sqrt
 
 private const val MP = ViewGroup.LayoutParams.MATCH_PARENT
 private const val WC = ViewGroup.LayoutParams.WRAP_CONTENT
 private val GREEN = 0xFF1FE01F.toInt()
+private val PEAK = 0xE61FE01F.toInt()
 
 /** Slider verticale. f = 0 in alto, 1 in basso. shutterLook = aspetto da pulsante di scatto (fuoco). */
 class VSlider(c: Context, private val thumbR: Float, private val shutterLook: Boolean) : View(c) {
@@ -303,13 +312,70 @@ class Tri(c: Context, private val left: Boolean) : View(c) {
     }
 }
 
+/** Vista con le stesse proporzioni dell'anteprima. */
+open class AspectView(c: Context) : View(c) {
+    private var rw = 0
+    private var rh = 0
+    fun setAspect(w: Int, h: Int) {
+        rw = w
+        rh = h
+        requestLayout()
+    }
+
+    override fun onMeasure(ws: Int, hs: Int) {
+        val w = MeasureSpec.getSize(ws)
+        val h = MeasureSpec.getSize(hs)
+        if (rw == 0 || rh == 0) {
+            setMeasuredDimension(w, h)
+            return
+        }
+        if (w.toLong() * rh < h.toLong() * rw) setMeasuredDimension(w, w * rh / rw)
+        else setMeasuredDimension(h * rw / rh, h)
+    }
+}
+
+/** Strato del focus peaking: punti verdi dove l'immagine è a fuoco. */
+class PeakView(c: Context) : AspectView(c) {
+    var bmp: Bitmap? = null
+    private val p = Paint().apply { isFilterBitmap = false }
+    private val dst = Rect()
+
+    override fun onDraw(cv: Canvas) {
+        val b = bmp ?: return
+        dst.set(0, 0, width, height)
+        cv.drawBitmap(b, null, dst, p)
+    }
+}
+
+/** Mirino al centro; senza zoom mostra anche il riquadro che verrà ingrandito. */
+class Reticle(c: Context) : AspectView(c) {
+    var win = 0f
+    private val d = c.resources.displayMetrics.density
+    private val p = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; strokeCap = Paint.Cap.ROUND }
+
+    override fun onDraw(cv: Canvas) {
+        val w = width.toFloat()
+        val h = height.toFloat()
+        val cx = w / 2
+        val cy = h / 2
+        for (pass in 0..1) {
+            p.strokeWidth = if (pass == 0) 3.5f * d else 1.5f * d
+            p.color = if (pass == 0) 0x99000000.toInt() else 0xCCFFFFFF.toInt()
+            cv.drawLine(cx - 9 * d, cy, cx + 9 * d, cy, p)
+            cv.drawLine(cx, cy - 9 * d, cx, cy + 9 * d, p)
+            if (win > 0f) cv.drawRect(cx - w * win / 2, cy - h * win / 2, cx + w * win / 2, cy + h * win / 2, p)
+        }
+    }
+}
+
 class MainActivity : Activity() {
 
     // ---- UI ----
     private lateinit var prefs: SharedPreferences
     private lateinit var stage: FrameLayout
     private lateinit var tv: AutoTex
-    private lateinit var pt: View
+    private lateinit var peak: PeakView
+    private lateinit var reticle: Reticle
     private lateinit var sl: VSlider
     private lateinit var ex: VSlider
     private lateinit var wb: HSlider
@@ -384,7 +450,36 @@ class MainActivity : Activity() {
     private var lblT = 0L
 
     // ---- voce ----
-    private var voiceOn = false
+    private var vmode = 0   // 0 spento, 1 parola «clicca», 2 rumore vocale
+    private val voiceOn: Boolean get() = vmode == 1
+    private val noiseOn: Boolean get() = vmode == 2
+    private var nSens = 1
+    @Volatile private var noiseRun = false
+    private var noiseThread: Thread? = null
+    private var rec: AudioRecord? = null
+    @Volatile private var nLevel = 0f
+    @Volatile private var nThr = 0f
+    @Volatile private var nBase = 0f
+    @Volatile private var nHits = 0
+
+    // ---- focus peaking (solo con zoom attivo e scena ferma) ----
+    private var peakRunning = false
+    private var sm: SensorManager? = null
+    private var gyroOk = false
+    @Volatile private var gAvg = 1f
+    @Volatile private var calmSince = 0L
+    private var pkBmp: Bitmap? = null
+    private var pkOut: Bitmap? = null
+    private var pkPix = IntArray(0)
+    private var pkLumA = IntArray(0)
+    private var pkLumB = IntArray(0)
+    private var pkGrad = IntArray(0)
+    private var pkMask = ByteArray(0)
+    private var pkCol = IntArray(0)
+    private val pkHist = IntArray(512)
+    private var pkHavePrev = false
+    private var pkFlip = false
+    private var peakStatus = "spento"
     private var sr: SpeechRecognizer? = null
     private var voiceStatus = ""
     private var vSessions = 0
@@ -414,7 +509,7 @@ class MainActivity : Activity() {
         }
     }
 
-    private val zoomOffR = Runnable { zoomed = false; placePt(); update() }
+    private val zoomOffR = Runnable { zoomed = false; stopPeak(); updateReticle(); update() }
     private val hideMsg = Runnable { msgV.visibility = View.GONE }
     private val hidePrompt = Runnable { promptV.visibility = View.GONE }
 
@@ -428,7 +523,8 @@ class MainActivity : Activity() {
         super.onCreate(b)
         prefs = getSharedPreferences("macro", MODE_PRIVATE)
         zoomF = prefs.getInt("z", 5)
-        voiceOn = prefs.getBoolean("voice", false)
+        vmode = prefs.getInt("vmode", 0)
+        nSens = prefs.getInt("nsens", 1)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         window.statusBarColor = Color.BLACK
         window.navigationBarColor = Color.BLACK
@@ -442,11 +538,12 @@ class MainActivity : Activity() {
         bg = Handler(bgT!!.looper)
         oriL.enable()
         if (tv.isAvailable) openCamera()
-        if (voiceOn) startVoice()
+        startMic()
     }
 
     override fun onPause() {
-        stopVoice()
+        stopMic()
+        stopPeak()
         oriL.disable()
         ui.removeCallbacks(zoomOffR)
         closeCamera()
@@ -469,8 +566,8 @@ class MainActivity : Activity() {
     override fun onRequestPermissionsResult(rc: Int, p: Array<out String>, r: IntArray) {
         super.onRequestPermissionsResult(rc, p, r)
         if (rc == 2) {
-            if (r.isNotEmpty() && r[0] == PackageManager.PERMISSION_GRANTED) startVoice()
-            else { setVoice(false); toast("Serve il permesso del microfono") }
+            if (r.isNotEmpty() && r[0] == PackageManager.PERMISSION_GRANTED) startMic()
+            else { setVmode(0); toast("Serve il permesso del microfono") }
             return
         }
         if (checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
@@ -553,33 +650,15 @@ class MainActivity : Activity() {
             override fun onSurfaceTextureDestroyed(s: SurfaceTexture): Boolean = true
             override fun onSurfaceTextureUpdated(s: SurfaceTexture) {}
         }
-        tv.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> placePt() }
         stage.addView(tv, FrameLayout.LayoutParams(MP, MP, Gravity.CENTER))
 
-        pt = View(this).apply {
-            background = GradientDrawable().apply {
-                shape = GradientDrawable.OVAL
-                setStroke(dp(3), Color.BLACK)
-                setColor(0x55FFFFFF)
-            }
-        }
-        stage.addView(pt, FrameLayout.LayoutParams(dp(46), dp(46), Gravity.TOP or Gravity.START))
-        pt.setOnTouchListener { _, e ->
-            when (e.actionMasked) {
-                MotionEvent.ACTION_DOWN -> !zoomed
-                MotionEvent.ACTION_MOVE -> {
-                    if (!zoomed) {
-                        val loc = IntArray(2)
-                        tv.getLocationOnScreen(loc)
-                        P.x = ((e.rawX - loc[0]) / max(1, tv.width)).coerceIn(0.1f, 0.9f)
-                        P.y = ((e.rawY - loc[1]) / max(1, tv.height)).coerceIn(0.1f, 0.9f)
-                        placePt()
-                    }
-                    true
-                }
-                else -> true
-            }
-        }
+        peak = PeakView(this)
+        peak.visibility = View.INVISIBLE
+        stage.addView(peak, FrameLayout.LayoutParams(MP, MP, Gravity.CENTER))
+        reticle = Reticle(this)
+        stage.addView(reticle, FrameLayout.LayoutParams(MP, MP, Gravity.CENTER))
+        // con lo zoom attivo, un tocco sullo schermo lo toglie
+        stage.setOnClickListener { if (zoomed) zoomOffR.run() }
 
         sl = VSlider(this, dpf(30), true)
         ex = VSlider(this, dpf(25), false)
@@ -673,7 +752,7 @@ class MainActivity : Activity() {
         updateWbUi()
         setMacro(true)
         onExp(0.5f)
-        onFocus(0f)
+        onFocus(0f, false)
         zoomOffR.run()
     }
 
@@ -687,6 +766,135 @@ class MainActivity : Activity() {
         val pads = dp(8) * 8 + dp(8)
         val px = ((avail - pads) / total).coerceIn(dpf(9), dpf(13))
         for (t in topChips) t.setTextSize(TypedValue.COMPLEX_UNIT_PX, px)
+    }
+
+    private val gyroL = object : SensorEventListener {
+        override fun onSensorChanged(e: SensorEvent) {
+            val m = sqrt(e.values[0] * e.values[0] + e.values[1] * e.values[1] + e.values[2] * e.values[2])
+            gAvg = 0.85f * gAvg + 0.15f * m
+            if (gAvg > 0.10f) calmSince = 0L else if (calmSince == 0L) calmSince = System.currentTimeMillis()
+        }
+        override fun onAccuracyChanged(s: Sensor?, a: Int) {}
+    }
+
+    private val peakTick = object : Runnable {
+        override fun run() {
+            if (!(peakRunning && zoomed && macroOn)) { stopPeak(); return }
+            try { stepPeaking() } catch (e: Exception) { peakStatus = "errore" }
+            ui.postDelayed(this, 200)
+        }
+    }
+
+    private fun startPeak() {
+        if (peakRunning) return
+        peakRunning = true
+        pkHavePrev = false
+        val m = getSystemService(Context.SENSOR_SERVICE) as SensorManager
+        sm = m
+        val g = m.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
+        gyroOk = g != null
+        if (g != null) {
+            gAvg = 1f
+            calmSince = 0L
+            m.registerListener(gyroL, g, SensorManager.SENSOR_DELAY_GAME)
+        }
+        ui.removeCallbacks(peakTick)
+        ui.post(peakTick)
+    }
+
+    private fun stopPeak() {
+        peakRunning = false
+        ui.removeCallbacks(peakTick)
+        try { sm?.unregisterListener(gyroL) } catch (e: Exception) {}
+        if (::peak.isInitialized) peak.visibility = View.INVISIBLE
+        peakStatus = "spento"
+    }
+
+    private fun hidePeak(why: String) {
+        peakStatus = why
+        pkHavePrev = false
+        if (peak.visibility != View.INVISIBLE) peak.visibility = View.INVISIBLE
+    }
+
+    /**
+     * Un passo del peaking. I calcoli costosi partono solo se:
+     *  1) il giroscopio dice che il telefono è fermo da almeno 250 ms;
+     *  2) due immagini consecutive sono quasi uguali (soggetto fermo).
+     * Si illuminano solo i punti ad altissimo contrasto che formano gruppi.
+     */
+    private fun stepPeaking() {
+        val now = System.currentTimeMillis()
+        if (gyroOk && !(calmSince != 0L && now - calmSince >= 250)) { hidePeak("telefono in movimento (" + String.format(Locale.US, "%.2f", gAvg) + ")"); return }
+        if (!tv.isAvailable || tv.width < 8) return
+        val gw = 176
+        val gh = max(8, gw * tv.height / tv.width)
+        var b = pkBmp
+        if (b == null || b.width != gw || b.height != gh) {
+            b = Bitmap.createBitmap(gw, gh, Bitmap.Config.ARGB_8888)
+            pkBmp = b
+            pkOut = Bitmap.createBitmap(gw, gh, Bitmap.Config.ARGB_8888)
+            val n = gw * gh
+            pkPix = IntArray(n); pkLumA = IntArray(n); pkLumB = IntArray(n)
+            pkGrad = IntArray(n); pkMask = ByteArray(n); pkCol = IntArray(n)
+            pkHavePrev = false
+        }
+        tv.getBitmap(b)
+        b.getPixels(pkPix, 0, gw, 0, 0, gw, gh)
+        val cur = if (pkFlip) pkLumB else pkLumA
+        val old = if (pkFlip) pkLumA else pkLumB
+        pkFlip = !pkFlip
+        val n = gw * gh
+        for (i in 0 until n) {
+            val c = pkPix[i]
+            cur[i] = (((c shr 16) and 255) * 77 + ((c shr 8) and 255) * 150 + (c and 255) * 29) shr 8
+        }
+        if (!pkHavePrev) { pkHavePrev = true; peakStatus = "in attesa"; return }
+        var diff = 0L
+        for (i in 0 until n) diff += abs(cur[i] - old[i])
+        val dm = diff.toFloat() / n
+        if (dm > 6f) { hidePeak("scena in movimento (" + String.format(Locale.US, "%.1f", dm) + ")"); pkHavePrev = true; return }
+
+        // gradiente e soglia al 98° percentile
+        java.util.Arrays.fill(pkHist, 0)
+        for (y in 1 until gh - 1) {
+            val r = y * gw
+            for (x in 1 until gw - 1) {
+                val i = r + x
+                val v = abs(cur[i + 1] - cur[i - 1]) + abs(cur[i + gw] - cur[i - gw])
+                pkGrad[i] = v
+                pkHist[if (v > 511) 511 else v]++
+            }
+        }
+        val target = ((gw - 2) * (gh - 2) * 0.98f).toInt()
+        var acc = 0
+        var p98 = 0
+        for (k in 0 until 512) { acc += pkHist[k]; if (acc >= target) { p98 = k; break } }
+        val thr = max(60, (p98 * 0.6f).toInt())
+
+        java.util.Arrays.fill(pkMask, 0)
+        for (y in 1 until gh - 1) {
+            val r = y * gw
+            for (x in 1 until gw - 1) { val i = r + x; if (pkGrad[i] >= thr) pkMask[i] = 1 }
+        }
+        // tiene solo i punti con almeno 3 vicini accesi: gruppi, non puntini sparsi
+        java.util.Arrays.fill(pkCol, 0)
+        var lit = 0
+        for (y in 2 until gh - 2) {
+            val r = y * gw
+            for (x in 2 until gw - 2) {
+                val i = r + x
+                if (pkMask[i].toInt() == 1) {
+                    val nb = pkMask[i - 1] + pkMask[i + 1] + pkMask[i - gw] + pkMask[i + gw] +
+                        pkMask[i - gw - 1] + pkMask[i - gw + 1] + pkMask[i + gw - 1] + pkMask[i + gw + 1]
+                    if (nb >= 3) { pkCol[i] = PEAK; lit++ }
+                }
+            }
+        }
+        pkOut!!.setPixels(pkCol, 0, gw, 0, 0, gw, gh)
+        peak.bmp = pkOut
+        peak.invalidate()
+        if (peak.visibility != View.VISIBLE) peak.visibility = View.VISIBLE
+        peakStatus = "attivo ($lit punti)"
     }
 
     private fun setSide(s: String) {
@@ -720,27 +928,16 @@ class MainActivity : Activity() {
         macroOn = on
         tvMacro.setTextColor(if (on) GREEN else Color.WHITE)
         sl.visibility = if (on) View.VISIBLE else View.GONE
-        pt.visibility = if (on) View.VISIBLE else View.INVISIBLE
-        if (!on) { ui.removeCallbacks(zoomOffR); zoomed = false }
-        placePt()
+        if (!on) { ui.removeCallbacks(zoomOffR); zoomed = false; stopPeak() }
+        updateReticle()
         update()
     }
 
-    private fun placePt() {
-        if (!::pt.isInitialized || !::tv.isInitialized) return
-        val w = tv.width.toFloat()
-        val h = tv.height.toFloat()
-        var sx = P.x
-        var sy = P.y
-        if (zoomed) {
-            val z = zoomF.toFloat()
-            val l = (P.x - 0.5f / z).coerceIn(0f, 1f - 1f / z)
-            val t = (P.y - 0.5f / z).coerceIn(0f, 1f - 1f / z)
-            sx = (P.x - l) * z
-            sy = (P.y - t) * z
-        }
-        pt.x = tv.left + sx * w - dp(23)
-        pt.y = tv.top + sy * h - dp(23)
+    private fun updateReticle() {
+        if (!::reticle.isInitialized) return
+        reticle.visibility = if (macroOn) View.VISIBLE else View.INVISIBLE
+        reticle.win = if (zoomed) 0f else 1f / zoomF
+        reticle.invalidate()
     }
 
     private fun toast(t: String) {
@@ -761,7 +958,7 @@ class MainActivity : Activity() {
     // =====================================================================
     // Controlli: fuoco, esposizione, ISO, bianco
     // =====================================================================
-    private fun onFocus(f: Float) {
+    private fun onFocus(f: Float, user: Boolean = true) {
         focusD = if (manualFocus) 1f + f * (minFocus - 1f) else 0f
         sl.label = when {
             !manualFocus -> "AF"
@@ -771,15 +968,15 @@ class MainActivity : Activity() {
             }
         }
         sl.invalidate()
-        if (macroOn) zoomOn()
+        if (macroOn && user) zoomOn()
         update()
     }
 
     private fun zoomOn() {
         zoomed = true
         ui.removeCallbacks(zoomOffR)
-        ui.postDelayed(zoomOffR, 1500)
-        placePt()
+        updateReticle()
+        startPeak()
     }
 
     private fun onExp(f: Float) {
@@ -908,9 +1105,11 @@ class MainActivity : Activity() {
 
         runOnUiThread {
             tv.setAspect(prev.height, prev.width)
+            peak.setAspect(prev.height, prev.width)
+            reticle.setAspect(prev.height, prev.width)
             wb.alpha = if (wbOk) 1f else 0.35f
             styleIso()
-            onFocus(sl.f)
+            onFocus(sl.f, false)
             onExp(ex.f)
             if (!manualFocus) toast("Questo telefono non permette il fuoco manuale")
         }
@@ -1193,7 +1392,7 @@ class MainActivity : Activity() {
             if (!voiceOn) return
             voiceStatus = "errore $e"
             if (e == 9) {
-                setVoice(false)
+                setVmode(0)
                 toast("Serve il permesso del microfono")
                 return
             }
@@ -1238,6 +1437,17 @@ class MainActivity : Activity() {
 
     private fun refreshVoiceDiag() {
         val t = voiceDiagTv ?: return
+        val pk = "\nPeaking: " + peakStatus
+        if (vmode == 2) {
+            val lvl = ((nLevel / max(1f, nThr)) * 10f).roundToInt().coerceIn(0, 10)
+            val bar = "█".repeat(lvl) + "░".repeat(10 - lvl)
+            t.text = "Scatto a rumore: " + (if (noiseRun) "attivo" else "spento") +
+                "\nLivello: " + bar + "  (pieno = scatta)" +
+                "\nSoglia: " + nThr.toInt() + "  ·  rumore di fondo: " + nBase.toInt() +
+                "\nScatti da rumore: " + nHits +
+                "\nUltimo scatto: " + vShot + pk
+            return
+        }
         val lvl = ((vRms + 2f) / 12f * 10f).roundToInt().coerceIn(0, 10)
         val bar = "█".repeat(lvl) + "░".repeat(10 - lvl)
         t.text = "Scatto vocale: " + (if (voiceOn) voiceStatus.ifEmpty { "attivo" } else "spento") +
@@ -1247,7 +1457,7 @@ class MainActivity : Activity() {
             "\nUltimo scatto: " + vShot +
             "\nUltimo errore: " + errName(vLastErr) +
             "\nSentito (parziale): «" + vLastPartial + "»" +
-            "\nSentito (finale): «" + vLastText + "»"
+            "\nSentito (finale): «" + vLastText + "»" + pk
     }
 
     private fun errText(e: Int) = when (e) {
@@ -1317,7 +1527,7 @@ class MainActivity : Activity() {
     private fun startVoice() {
         if (!voiceOn || sr != null) return
         if (!SpeechRecognizer.isRecognitionAvailable(this)) {
-            setVoice(false)
+            setVmode(0)
             toast("Riconoscimento vocale non disponibile su questo telefono")
             return
         }
@@ -1331,7 +1541,7 @@ class MainActivity : Activity() {
         listenOnce()
         ui.removeCallbacks(voiceWatch)
         ui.postDelayed(voiceWatch, 4000)
-        toast("Scatto vocale attivo: di' «clic»")
+        toast("Scatto vocale attivo: di' «clicca»")
     }
 
     private fun stopVoice() {
@@ -1341,11 +1551,91 @@ class MainActivity : Activity() {
         muteBeep(false)
     }
 
-    private fun setVoice(on: Boolean) {
-        voiceOn = on
-        prefs.edit().putBoolean("voice", on).apply()
-        if (on) startVoice() else stopVoice()
+    private fun setVmode(m: Int) {
+        stopMic()
+        vmode = m
+        prefs.edit().putInt("vmode", m).apply()
+        startMic()
         if (dlg?.isShowing == true) settingsBox?.let { fillSettings(it) }
+    }
+
+    private fun startMic() {
+        when (vmode) {
+            1 -> startVoice()
+            2 -> startNoise()
+        }
+    }
+
+    private fun stopMic() {
+        stopVoice()
+        stopNoise()
+    }
+
+    /** Scatto a rumore: parte appena un suono netto supera il rumore di fondo (molto più rapido della parola). */
+    @SuppressLint("MissingPermission")
+    private fun startNoise() {
+        if (!noiseOn || noiseRun) return
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 2)
+            return
+        }
+        val rate = 16000
+        val minBuf = AudioRecord.getMinBufferSize(rate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
+        val r = try {
+            AudioRecord(MediaRecorder.AudioSource.MIC, rate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, max(minBuf, 4096) * 2)
+        } catch (e: Exception) { null }
+        if (minBuf <= 0 || r == null || r.state != AudioRecord.STATE_INITIALIZED) {
+            try { r?.release() } catch (e: Exception) {}
+            toast("Microfono non disponibile")
+            setVmode(0)
+            return
+        }
+        rec = r
+        noiseRun = true
+        r.startRecording()
+        noiseThread = Thread {
+            val buf = ShortArray(rate / 50)   // finestre da 20 ms
+            var base = 0f
+            var warm = 0
+            var cool = 0L
+            while (noiseRun) {
+                val n = r.read(buf, 0, buf.size)
+                if (n <= 0) continue
+                var sum = 0.0
+                for (i in 0 until n) { val v = buf[i].toDouble(); sum += v * v }
+                val rms = sqrt(sum / n).toFloat()
+                nLevel = rms
+                if (warm < 25) {
+                    base = if (warm == 0) rms else base * 0.9f + rms * 0.1f
+                    warm++
+                    nBase = base
+                    continue
+                }
+                val k = when (nSens) { 0 -> 8f; 2 -> 3.5f; else -> 5f }
+                val floor = when (nSens) { 0 -> 3000f; 2 -> 1000f; else -> 1800f }
+                val thr = max(base * k, floor)
+                nThr = thr
+                val now = System.currentTimeMillis()
+                if (rms > thr && now > cool) {
+                    cool = now + 2500
+                    nHits++
+                    ui.post { shoot() }
+                } else if (rms <= thr) {
+                    base = base * 0.98f + rms * 0.02f
+                }
+                nBase = base
+            }
+        }.also { it.start() }
+        toast("Scatto a rumore attivo: pronuncia un suono netto")
+    }
+
+    private fun stopNoise() {
+        noiseRun = false
+        try { rec?.stop() } catch (e: Exception) {}
+        try { noiseThread?.join(300) } catch (e: Exception) {}
+        noiseThread = null
+        try { rec?.release() } catch (e: Exception) {}
+        rec = null
     }
 
     /** Silenzia il "din" che il riconoscimento vocale emette a ogni ascolto. */
@@ -1403,15 +1693,25 @@ class MainActivity : Activity() {
 
         box.addView(label("INGRANDIMENTO MENTRE METTI A FUOCO"))
         box.addView(row(
-            btn("3×", zoomF == 3) { zoomF = 3; prefs.edit().putInt("z", 3).apply(); fillSettings(box) },
-            btn("5×", zoomF == 5) { zoomF = 5; prefs.edit().putInt("z", 5).apply(); fillSettings(box) },
-            btn("8×", zoomF == 8) { zoomF = 8; prefs.edit().putInt("z", 8).apply(); fillSettings(box) }
+            btn("3×", zoomF == 3) { zoomF = 3; prefs.edit().putInt("z", 3).apply(); updateReticle(); fillSettings(box) },
+            btn("5×", zoomF == 5) { zoomF = 5; prefs.edit().putInt("z", 5).apply(); updateReticle(); fillSettings(box) },
+            btn("8×", zoomF == 8) { zoomF = 8; prefs.edit().putInt("z", 8).apply(); updateReticle(); fillSettings(box) }
         ))
 
-        box.addView(label("SCATTO VOCALE"))
+        box.addView(label("SCATTO A VOCE"))
         box.addView(row(
-            btn("Di' «clic» per scattare", voiceOn) { setVoice(!voiceOn) }
+            btn("Spento", vmode == 0) { setVmode(0) },
+            btn("Parola «clicca»", vmode == 1) { setVmode(1) },
+            btn("Rumore vocale", vmode == 2) { setVmode(2) }
         ))
+        if (vmode == 2) {
+            box.addView(label("SENSIBILITÀ (PIÙ ALTA = SCATTA CON SUONI PIÙ DEBOLI)"))
+            box.addView(row(
+                btn("Bassa", nSens == 0) { nSens = 0; prefs.edit().putInt("nsens", 0).apply(); fillSettings(box) },
+                btn("Media", nSens == 1) { nSens = 1; prefs.edit().putInt("nsens", 1).apply(); fillSettings(box) },
+                btn("Alta", nSens == 2) { nSens = 2; prefs.edit().putInt("nsens", 2).apply(); fillSettings(box) }
+            ))
+        }
 
         box.addView(label("FORMATO"))
         box.addView(TextView(this).apply {
@@ -1429,6 +1729,12 @@ class MainActivity : Activity() {
         }
         box.addView(voiceDiagTv)
         refreshVoiceDiag()
+
+        box.addView(TextView(this).apply {
+            text = "Macrocamera by Pino Settino"
+            setTextColor(0xFF8A8A90.toInt()); textSize = 12f; gravity = Gravity.CENTER
+            setPadding(0, dp(18), 0, dp(6))
+        }, LinearLayout.LayoutParams(MP, WC))
     }
 
     private fun pickFolder() {
