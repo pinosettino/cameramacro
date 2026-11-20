@@ -85,6 +85,8 @@ import kotlin.math.sqrt
 private const val MP = ViewGroup.LayoutParams.MATCH_PARENT
 private const val WC = ViewGroup.LayoutParams.WRAP_CONTENT
 private val GREEN = 0xFF1FE01F.toInt()
+private val MULS = floatArrayOf(1f, 0.85f, 0.7f)   // moltiplicatori della distanza minima di fuoco
+private const val FINE_FRAC = 0.10f                 // scala fine = 1/10 dell'intera corsa (in diottrie)
 
 /** Slider verticale. f = 0 in alto, 1 in basso. shutterLook = aspetto da pulsante di scatto (fuoco). */
 class VSlider(c: Context, private val thumbR: Float, private val shutterLook: Boolean) : View(c) {
@@ -92,12 +94,17 @@ class VSlider(c: Context, private val thumbR: Float, private val shutterLook: Bo
     var label = ""
     var labelRight = true
     var snap = 0f
+    var topText = ""
+    var botText = ""
+    var showDot = false
+    var dotOn = false
+    var onDot: () -> Unit = {}
     var onChange: (Float) -> Unit = {}
     var onTap: () -> Unit = {}
     var onDouble: () -> Unit = {}
 
     private val d = c.resources.displayMetrics.density
-    private val padV get() = thumbR + 6 * d
+    private val padV get() = thumbR + 14 * d
     private val p = Paint(Paint.ANTI_ALIAS_FLAG)
     private var rel = false
     private var onThumb = false
@@ -105,6 +112,16 @@ class VSlider(c: Context, private val thumbR: Float, private val shutterLook: Bo
     private var y0 = 0f
     private var f0 = 0f
     private var lastTap = 0L
+    private var dotDown = false
+
+    /** Il pallino sta subito sotto la manopola (sopra, se la manopola è in fondo). */
+    private fun dotY(): Float {
+        val y = ty()
+        val below = y + thumbR + 16 * d
+        return if (below + 11 * d <= height - 12 * d) below else y - thumbR - 16 * d
+    }
+
+    private fun hitDot(e: MotionEvent) = showDot && abs(e.x - width / 2f) <= 24 * d && abs(e.y - dotY()) <= 24 * d
 
     private fun ty() = padV + f * (height - 2 * padV)
 
@@ -148,10 +165,38 @@ class VSlider(c: Context, private val thumbR: Float, private val shutterLook: Bo
             p.color = Color.BLACK
             cv.drawText(label, x, y + p.textSize / 3, p)
         }
+
+        if (showDot) {
+            val dy = dotY()
+            p.style = Paint.Style.FILL
+            p.color = Color.BLACK
+            cv.drawCircle(x, dy, 10 * d, p)
+            p.color = if (dotOn) GREEN else Color.WHITE
+            cv.drawCircle(x, dy, 7.5f * d, p)
+        }
+
+        p.style = Paint.Style.FILL
+        p.textSize = 10 * d
+        p.textAlign = Paint.Align.CENTER
+        p.color = Color.WHITE
+        p.setShadowLayer(3 * d, 0f, 1f, Color.BLACK)
+        cv.drawText(topText, x, 11 * d, p)
+        cv.drawText(botText, x, height - 3 * d, p)
+        p.clearShadowLayer()
     }
 
     override fun onTouchEvent(e: MotionEvent): Boolean {
         val span = max(1f, height - 2 * padV)
+        if (e.actionMasked == MotionEvent.ACTION_DOWN && hitDot(e)) {
+            dotDown = true
+            parent.requestDisallowInterceptTouchEvent(true)
+            return true
+        }
+        if (dotDown) {
+            if (e.actionMasked == MotionEvent.ACTION_UP) { dotDown = false; if (hitDot(e)) onDot() }
+            else if (e.actionMasked == MotionEvent.ACTION_CANCEL) dotDown = false
+            return true
+        }
         when (e.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 parent.requestDisallowInterceptTouchEvent(true)
@@ -424,7 +469,14 @@ class MainActivity : Activity() {
     private var t0 = 10_000_000.0
     private var exEv = 0f
     private var zoomed = false
-    private var zoomF = 5
+    private var fine = false          // scala fine del fuoco (e zoom 8×)
+    private var fineLo = 1f           // diottrie all'estremo lontano della scala fine
+    private var fineW = 0f            // ampiezza della scala fine, in diottrie
+    private var minMul = 1f           // moltiplicatore della distanza minima (impostazioni)
+    @Volatile private var gotFocusD = 0f
+    private val zoomF: Int get() = if (fine) 8 else 5
+    /** Estremo vicino della scala, in diottrie (più alto = più vicino). */
+    private val effMin: Float get() = if (minFocus > 1f) minFocus / minMul else minFocus
     private val P = PointF(0.5f, 0.5f)
     private var wbShift = 0f
     private var wbLockBtn = false
@@ -497,7 +549,7 @@ class MainActivity : Activity() {
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
         prefs = getSharedPreferences("macro", MODE_PRIVATE)
-        zoomF = prefs.getInt("z", 5)
+        minMul = MULS[prefs.getInt("minf", 0).coerceIn(0, MULS.size - 1)]
         vmode = prefs.getInt("vmode", 0)
         nSens = prefs.getInt("nsens", 1)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -653,6 +705,7 @@ class MainActivity : Activity() {
         ex.snap = 0.045f
         sl.onChange = { f -> onFocus(f) }
         sl.onTap = { shoot() }
+        sl.onDot = { setFine(!fine) }
         ex.onChange = { f -> onExp(f) }
         ex.onDouble = { ex.f = 0.5f; onExp(0.5f); ex.invalidate() }
         stage.addView(sl)
@@ -860,18 +913,79 @@ class MainActivity : Activity() {
     // =====================================================================
     // Controlli: fuoco, esposizione, ISO, bianco
     // =====================================================================
+    private fun fmtCm(cm: Float, dec: Boolean): String =
+        if (dec || (cm < 10f && abs(cm - cm.roundToInt()) >= 0.05f)) String.format(Locale.US, "%.1f", cm)
+        else cm.roundToInt().toString()
+
     private fun onFocus(f: Float, user: Boolean = true) {
-        focusD = if (manualFocus) 1f + f * (minFocus - 1f) else 0f
-        sl.label = when {
-            !manualFocus -> "AF"
-            else -> {
-                val cm = 100f / focusD
-                (if (cm >= 10f) cm.roundToInt().toString() else String.format(Locale.US, "%.1f", cm)) + " cm"
-            }
+        focusD = when {
+            !manualFocus -> 0f
+            fine -> fineLo + f * fineW
+            else -> 1f + f * (effMin - 1f)
         }
+        sl.label = if (!manualFocus) "AF" else fmtCm(100f / focusD, fine) + " cm"
         sl.invalidate()
         if (macroOn && user) zoomOn()
         update()
+    }
+
+    /** Scrive ai due estremi dello slider i valori in cm della scala in uso. */
+    private fun updateEnds() {
+        if (!manualFocus) {
+            sl.topText = ""
+            sl.botText = ""
+        } else if (fine) {
+            sl.topText = fmtCm(100f / fineLo, true) + " cm"
+            sl.botText = fmtCm(100f / (fineLo + fineW), true) + " cm"
+        } else {
+            sl.topText = "100 cm"
+            sl.botText = fmtCm(100f / effMin, false) + " cm"
+        }
+        sl.invalidate()
+    }
+
+    /** Pallino: attiva/disattiva la scala fine attorno al fuoco attuale (e lo zoom 8×). */
+    private fun setFine(on: Boolean) {
+        if (!manualFocus || on == fine) return
+        val d = if (focusD > 0f) focusD else 1f
+        fine = on
+        if (on) {
+            fineW = FINE_FRAC * (effMin - 1f)
+            fineLo = (d - fineW / 2).coerceIn(1f, effMin - fineW)
+            sl.f = ((d - fineLo) / fineW).coerceIn(0f, 1f)
+        } else {
+            sl.f = ((d - 1f) / (effMin - 1f)).coerceIn(0f, 1f)
+        }
+        sl.dotOn = on
+        updateEnds()
+        onFocus(sl.f, false)
+        clampP()
+        if (on) zoomOn() else updateReticle()
+        update()
+    }
+
+    /** Cambia il moltiplicatore della distanza minima mantenendo il fuoco dov'è. */
+    private fun setMinMul(i: Int) {
+        val d = if (focusD > 0f) focusD else 1f
+        if (fine) { fine = false; sl.dotOn = false }
+        minMul = MULS[i]
+        prefs.edit().putInt("minf", i).apply()
+        sl.f = ((d - 1f) / (effMin - 1f)).coerceIn(0f, 1f)
+        updateEnds()
+        onFocus(sl.f, false)
+        clampP()
+        updateReticle()
+        update()
+        if (dlg?.isShowing == true) settingsBox?.let { fillSettings(it) }
+    }
+
+    private fun focusLine(): String {
+        if (!manualFocus) return "Fuoco: autofocus"
+        val req = if (focusD > 0f) 100f / focusD else 0f
+        val got = if (gotFocusD > 0f) 100f / gotFocusD else 0f
+        val lim = focusD > minFocus * 1.02f && gotFocusD < focusD * 0.97f
+        return "Fuoco: richiesto " + String.format(Locale.US, "%.1f", req) + " cm · applicato " +
+            String.format(Locale.US, "%.1f", got) + " cm" + (if (lim) "  ← limitato dal telefono" else "")
     }
 
     private fun zoomOn() {
@@ -1009,6 +1123,8 @@ class MainActivity : Activity() {
             reticle.setAspect(prev.height, prev.width)
             wb.alpha = if (wbOk) 1f else 0.35f
             styleIso()
+            sl.showDot = manualFocus
+            updateEnds()
             onFocus(sl.f, false)
             onExp(ex.f)
             if (!manualFocus) toast("Questo telefono non permette il fuoco manuale")
@@ -1108,6 +1224,7 @@ class MainActivity : Activity() {
             lensMoving = res.get(CaptureResult.LENS_STATE) == CameraMetadata.LENS_STATE_MOVING
             res.get(CaptureResult.SENSOR_EXPOSURE_TIME)?.let { lastExp = it }
             res.get(CaptureResult.SENSOR_SENSITIVITY)?.let { lastIso = it }
+            res.get(CaptureResult.LENS_FOCUS_DISTANCE)?.let { gotFocusD = it }
             if (!usedManual) {
                 res.get(CaptureResult.COLOR_CORRECTION_GAINS)?.let { baseG = it }
                 res.get(CaptureResult.COLOR_CORRECTION_TRANSFORM)?.let { baseT = it }
@@ -1344,7 +1461,8 @@ class MainActivity : Activity() {
                 "\nLivello: " + bar + "  (pieno = scatta)" +
                 "\nSoglia: " + nThr.toInt() + "  ·  rumore di fondo: " + nBase.toInt() +
                 "\nScatti da rumore: " + nHits +
-                "\nUltimo scatto: " + vShot
+                "\nUltimo scatto: " + vShot +
+                "\n" + focusLine()
             return
         }
         val lvl = ((vRms + 2f) / 12f * 10f).roundToInt().coerceIn(0, 10)
@@ -1356,7 +1474,8 @@ class MainActivity : Activity() {
             "\nUltimo scatto: " + vShot +
             "\nUltimo errore: " + errName(vLastErr) +
             "\nSentito (parziale): «" + vLastPartial + "»" +
-            "\nSentito (finale): «" + vLastText + "»"
+            "\nSentito (finale): «" + vLastText + "»" +
+            "\n" + focusLine()
     }
 
     private fun errText(e: Int) = when (e) {
@@ -1590,12 +1709,16 @@ class MainActivity : Activity() {
             btn("Predefinita", tree == null) { prefs.edit().remove("tree").apply(); fillSettings(box) }
         ))
 
-        box.addView(label("INGRANDIMENTO MENTRE METTI A FUOCO"))
-        box.addView(row(
-            btn("3×", zoomF == 3) { zoomF = 3; prefs.edit().putInt("z", 3).apply(); clampP(); updateReticle(); fillSettings(box) },
-            btn("5×", zoomF == 5) { zoomF = 5; prefs.edit().putInt("z", 5).apply(); clampP(); updateReticle(); fillSettings(box) },
-            btn("8×", zoomF == 8) { zoomF = 8; prefs.edit().putInt("z", 8).apply(); clampP(); updateReticle(); fillSettings(box) }
-        ))
+        box.addView(label("DISTANZA MINIMA DI FUOCO (× QUELLA DICHIARATA DAL TELEFONO)"))
+        val base = if (minFocus > 1f) 100f / minFocus else 0f
+        val names = arrayOf("1.0×", "0.85×", "0.7×")
+        box.addView(row(*Array(MULS.size) { i ->
+            btn(names[i] + (if (base > 0f) "\n" + fmtCm(base * MULS[i], false) + " cm" else ""), minMul == MULS[i]) { setMinMul(i) }
+        }))
+        box.addView(TextView(this).apply {
+            text = "Sotto il valore dichiarato il telefono può ignorare la richiesta: controlla la riga «Fuoco» nella diagnostica."
+            setTextColor(0xFF9A9AA0.toInt()); textSize = 11f; setPadding(0, dp(4), 0, 0)
+        })
 
         box.addView(label("SCATTO A VOCE"))
         box.addView(row(
