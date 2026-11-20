@@ -85,7 +85,7 @@ import kotlin.math.sqrt
 private const val MP = ViewGroup.LayoutParams.MATCH_PARENT
 private const val WC = ViewGroup.LayoutParams.WRAP_CONTENT
 private val GREEN = 0xFF1FE01F.toInt()
-private val MULS = floatArrayOf(1f, 0.85f, 0.7f)   // moltiplicatori della distanza minima di fuoco
+private val MULS = floatArrayOf(1f, 0.85f, 0.7f, 0.6f, 0.5f)   // moltiplicatori della distanza minima di fuoco
 private const val FINE_FRAC = 0.10f                 // scala fine = 1/10 dell'intera corsa (in diottrie)
 
 /** Slider verticale. f = 0 in alto, 1 in basso. shutterLook = aspetto da pulsante di scatto (fuoco). */
@@ -1291,7 +1291,7 @@ class MainActivity : Activity() {
             b.set(CaptureRequest.JPEG_ORIENTATION, lastJpegOri)
             s.capture(b.build(), object : CameraCaptureSession.CaptureCallback() {
                 override fun onCaptureCompleted(s: CameraCaptureSession, r: CaptureRequest, res: TotalCaptureResult) {
-                    vShot = "scatto eseguito, salvo…"
+                    if (vShot == "avviato") vShot = "scatto eseguito, salvo…"
                 }
                 override fun onCaptureFailed(s: CameraCaptureSession, r: CaptureRequest, f: CaptureFailure) {
                     busy = false
@@ -1711,10 +1711,11 @@ class MainActivity : Activity() {
 
         box.addView(label("DISTANZA MINIMA DI FUOCO (× QUELLA DICHIARATA DAL TELEFONO)"))
         val base = if (minFocus > 1f) 100f / minFocus else 0f
-        val names = arrayOf("1.0×", "0.85×", "0.7×")
-        box.addView(row(*Array(MULS.size) { i ->
-            btn(names[i] + (if (base > 0f) "\n" + fmtCm(base * MULS[i], false) + " cm" else ""), minMul == MULS[i]) { setMinMul(i) }
-        }))
+        val names = arrayOf("1.0×", "0.85×", "0.7×", "0.6×", "0.5×")
+        fun mb(i: Int) = btn(names[i] + (if (base > 0f) "\n" + fmtCm(base * MULS[i], false) + " cm" else ""), minMul == MULS[i]) { setMinMul(i) }
+        box.addView(row(mb(0), mb(1), mb(2)))
+        box.addView(label("ESPERIMENTO: OLTRE IL LIMITE REALE DELLA LENTE L'IMMAGINE RESTA SFOCATA"))
+        box.addView(row(mb(3), mb(4)))
         box.addView(TextView(this).apply {
             text = "Sotto il valore dichiarato il telefono può ignorare la richiesta: controlla la riga «Fuoco» nella diagnostica."
             setTextColor(0xFF9A9AA0.toInt()); textSize = 11f; setPadding(0, dp(4), 0, 0)
