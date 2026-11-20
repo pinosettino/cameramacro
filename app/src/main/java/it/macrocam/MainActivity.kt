@@ -38,7 +38,6 @@ import android.hardware.camera2.TotalCaptureResult
 import android.hardware.camera2.params.ColorSpaceTransform
 import android.hardware.camera2.params.RggbChannelVector
 import android.media.AudioFormat
-import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.ImageReader
 import android.media.MediaRecorder
@@ -51,9 +50,6 @@ import android.os.HandlerThread
 import android.os.Looper
 import android.provider.DocumentsContract
 import android.provider.MediaStore
-import android.speech.RecognitionListener
-import android.speech.RecognizerIntent
-import android.speech.SpeechRecognizer
 import android.util.Size
 import android.util.TypedValue
 import android.view.Gravity
@@ -78,6 +74,7 @@ import java.util.Date
 import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.pow
 import kotlin.math.roundToInt
 import kotlin.math.sqrt
@@ -85,8 +82,7 @@ import kotlin.math.sqrt
 private const val MP = ViewGroup.LayoutParams.MATCH_PARENT
 private const val WC = ViewGroup.LayoutParams.WRAP_CONTENT
 private val GREEN = 0xFF1FE01F.toInt()
-private val MULS = floatArrayOf(1f, 0.85f, 0.7f, 0.6f, 0.5f)   // moltiplicatori della distanza minima di fuoco
-private const val FINE_FRAC = 0.10f                 // scala fine = 1/10 dell'intera corsa (in diottrie)
+private val MULS = floatArrayOf(1f, 0.7f, 0.55f)   // moltiplicatori della distanza minima di fuoco
 
 /** Slider verticale. f = 0 in alto, 1 in basso. shutterLook = aspetto da pulsante di scatto (fuoco). */
 class VSlider(c: Context, private val thumbR: Float, private val shutterLook: Boolean) : View(c) {
@@ -374,7 +370,7 @@ open class AspectView(c: Context) : View(c) {
     }
 }
 
-/** Finestra mobile: mostra il riquadro che verrà ingrandito (si trascina); con lo zoom resta la crocetta al centro. */
+/** Finestra mobile: mostra il riquadro che verrà ingrandito (si trascina); con lo zoom attivo sparisce. */
 class Reticle(c: Context) : AspectView(c) {
     var win = 0f
     var px = 0.5f
@@ -383,16 +379,15 @@ class Reticle(c: Context) : AspectView(c) {
     private val p = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; strokeCap = Paint.Cap.ROUND }
 
     override fun onDraw(cv: Canvas) {
+        if (win <= 0f) return
         val w = width.toFloat()
         val h = height.toFloat()
-        val cx = if (win > 0f) px * w else w / 2
-        val cy = if (win > 0f) py * h else h / 2
+        val cx = px * w
+        val cy = py * h
         for (pass in 0..1) {
             p.strokeWidth = if (pass == 0) 3.5f * d else 1.5f * d
             p.color = if (pass == 0) 0x99000000.toInt() else 0xCCFFFFFF.toInt()
-            cv.drawLine(cx - 9 * d, cy, cx + 9 * d, cy, p)
-            cv.drawLine(cx, cy - 9 * d, cx, cy + 9 * d, p)
-            if (win > 0f) cv.drawRect(cx - w * win / 2, cy - h * win / 2, cx + w * win / 2, cy + h * win / 2, p)
+            cv.drawRect(cx - w * win / 2, cy - h * win / 2, cx + w * win / 2, cy + h * win / 2, p)
         }
     }
 }
@@ -469,12 +464,12 @@ class MainActivity : Activity() {
     private var t0 = 10_000_000.0
     private var exEv = 0f
     private var zoomed = false
-    private var fine = false          // scala fine del fuoco (e zoom 8×)
-    private var fineLo = 1f           // diottrie all'estremo lontano della scala fine
-    private var fineW = 0f            // ampiezza della scala fine, in diottrie
+    private var big = false           // pallino: zoom 10× invece di 5×
+    @Volatile private var maxZoom = 1f
     private var minMul = 1f           // moltiplicatore della distanza minima (impostazioni)
     @Volatile private var gotFocusD = 0f
-    private val zoomF: Int get() = if (fine) 8 else 5
+    /** Ingrandimento in uso: 5× o 10×, ma mai oltre il massimo che il telefono permette. */
+    private val zoomF: Float get() = min(if (big) 10f else 5f, max(1f, maxZoom))
     /** Estremo vicino della scala, in diottrie (più alto = più vicino). */
     private val effMin: Float get() = if (minFocus > 1f) minFocus / minMul else minFocus
     private val P = PointF(0.5f, 0.5f)
@@ -495,8 +490,7 @@ class MainActivity : Activity() {
     private var lblT = 0L
 
     // ---- voce ----
-    private var vmode = 0   // 0 spento, 1 parola «clicca», 2 rumore vocale
-    private val voiceOn: Boolean get() = vmode == 1
+    private var vmode = 0   // 0 spento, 2 rumore vocale
     private val noiseOn: Boolean get() = vmode == 2
     private var nSens = 1
     @Volatile private var noiseRun = false
@@ -507,18 +501,8 @@ class MainActivity : Activity() {
     @Volatile private var nBase = 0f
     @Volatile private var nHits = 0
 
-    private var sr: SpeechRecognizer? = null
-    private var voiceStatus = ""
-    private var vSessions = 0
-    private var vHits = 0
-    private var vRecreated = 0
-    @Volatile private var vLastEvent = 0L
     @Volatile private var vShot = "nessuno"
     private var busySince = 0L
-    private var vLastErr = 0
-    private var vLastText = ""
-    private var vLastPartial = ""
-    @Volatile private var vRms = -2f
     private var voiceDiagTv: TextView? = null
     private val diagTick = object : Runnable {
         override fun run() {
@@ -526,7 +510,6 @@ class MainActivity : Activity() {
             if (dlg?.isShowing == true) ui.postDelayed(this, 300)
         }
     }
-    private var lastNote = 0L
 
     private val oriL by lazy {
         object : OrientationEventListener(this) {
@@ -705,7 +688,7 @@ class MainActivity : Activity() {
         ex.snap = 0.045f
         sl.onChange = { f -> onFocus(f) }
         sl.onTap = { shoot() }
-        sl.onDot = { setFine(!fine) }
+        sl.onDot = { toggleBig() }
         ex.onChange = { f -> onExp(f) }
         ex.onDouble = { ex.f = 0.5f; onExp(0.5f); ex.invalidate() }
         stage.addView(sl)
@@ -920,10 +903,9 @@ class MainActivity : Activity() {
     private fun onFocus(f: Float, user: Boolean = true) {
         focusD = when {
             !manualFocus -> 0f
-            fine -> fineLo + f * fineW
             else -> 1f + f * (effMin - 1f)
         }
-        sl.label = if (!manualFocus) "AF" else fmtCm(100f / focusD, fine) + " cm"
+        sl.label = if (!manualFocus) "AF" else fmtCm(100f / focusD, false) + " cm"
         sl.invalidate()
         if (macroOn && user) zoomOn()
         update()
@@ -934,9 +916,6 @@ class MainActivity : Activity() {
         if (!manualFocus) {
             sl.topText = ""
             sl.botText = ""
-        } else if (fine) {
-            sl.topText = fmtCm(100f / fineLo, true) + " cm"
-            sl.botText = fmtCm(100f / (fineLo + fineW), true) + " cm"
         } else {
             sl.topText = "100 cm"
             sl.botText = fmtCm(100f / effMin, false) + " cm"
@@ -944,30 +923,18 @@ class MainActivity : Activity() {
         sl.invalidate()
     }
 
-    /** Pallino: attiva/disattiva la scala fine attorno al fuoco attuale (e lo zoom 8×). */
-    private fun setFine(on: Boolean) {
-        if (!manualFocus || on == fine) return
-        val d = if (focusD > 0f) focusD else 1f
-        fine = on
-        if (on) {
-            fineW = FINE_FRAC * (effMin - 1f)
-            fineLo = (d - fineW / 2).coerceIn(1f, effMin - fineW)
-            sl.f = ((d - fineLo) / fineW).coerceIn(0f, 1f)
-        } else {
-            sl.f = ((d - 1f) / (effMin - 1f)).coerceIn(0f, 1f)
-        }
-        sl.dotOn = on
-        updateEnds()
-        onFocus(sl.f, false)
+    /** Pallino: passa l'ingrandimento da 5× a 10× (o al massimo del telefono) e viceversa. */
+    private fun toggleBig() {
+        big = !big
+        sl.dotOn = big
         clampP()
-        if (on) zoomOn() else updateReticle()
+        if (big) zoomOn() else updateReticle()
         update()
     }
 
     /** Cambia il moltiplicatore della distanza minima mantenendo il fuoco dov'è. */
     private fun setMinMul(i: Int) {
         val d = if (focusD > 0f) focusD else 1f
-        if (fine) { fine = false; sl.dotOn = false }
         minMul = MULS[i]
         prefs.edit().putInt("minf", i).apply()
         sl.f = ((d - 1f) / (effMin - 1f)).coerceIn(0f, 1f)
@@ -977,6 +944,12 @@ class MainActivity : Activity() {
         updateReticle()
         update()
         if (dlg?.isShowing == true) settingsBox?.let { fillSettings(it) }
+    }
+
+    private fun zoomLine(): String {
+        val z = String.format(Locale.US, "%.1f", maxZoom)
+        return if (maxZoom >= 10f) "Zoom: 5× e 10× (massimo del telefono $z×)"
+        else "Zoom: 5× e $z× (limite del telefono: non arriva a 10×)"
     }
 
     private fun focusLine(): String {
@@ -1091,6 +1064,7 @@ class MainActivity : Activity() {
             ?: ps.maxByOrNull { it.width.toLong() * it.height }!!
         arr = ch.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)!!
         sensorOri = ch.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
+        maxZoom = ch.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM) ?: 1f
         minFocus = ch.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0f
         manualFocus = minFocus > 1f
         val caps = ch.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
@@ -1111,12 +1085,9 @@ class MainActivity : Activity() {
             CameraMetadata.INFO_SUPPORTED_HARDWARE_LEVEL_3 -> "LEVEL_3"
             else -> "?"
         }
-        diag = "Camera ID: $camId ($lvl)\n" +
-            "Foto: ${jpeg.width}×${jpeg.height}  ·  anteprima ${prev.width}×${prev.height}\n" +
-            "Fuoco manuale: " + (if (manualFocus) "sì, minimo " + String.format(Locale.US, "%.1f", 100f / minFocus) + " cm" else "NO (resta autofocus)") + "\n" +
-            "ISO manuale: " + (if (manualOk) "sì ($isoMin–$isoMax)" else "NO") + "\n" +
-            "Compensazione EV: " + String.format(Locale.US, "%.1f…%.1f", aeMin, aeMax) + "\n" +
-            "Bianco manuale: " + (if (wbOk) "sì" else "NO") + "  ·  blocco bianco: " + (if (awbLockOk) "sì" else "NO")
+        diag = "Fotocamera ID $camId ($lvl) · ${jpeg.width}×${jpeg.height}\n" +
+            "Fuoco manuale: " + (if (manualFocus) "sì, minimo dichiarato " + String.format(Locale.US, "%.1f", 100f / minFocus) + " cm" else "NO (resta autofocus)") + "\n" +
+            "ISO manuale: " + (if (manualOk) "sì ($isoMin–$isoMax)" else "NO") + "  ·  bianco manuale: " + (if (wbOk) "sì" else "NO")
 
         runOnUiThread {
             tv.setAspect(prev.height, prev.width)
@@ -1175,9 +1146,9 @@ class MainActivity : Activity() {
         else -> Pair(dx, dy)
     }
 
-    private fun cropFor(z: Int): Rect {
-        val w = arr.width() / z.toFloat()
-        val h = arr.height() / z.toFloat()
+    private fun cropFor(z: Float): Rect {
+        val w = arr.width() / z
+        val h = arr.height() / z
         val (sx, sy) = toSensor(P.x, P.y)
         val l = (arr.left + sx * arr.width() - w / 2).coerceIn(arr.left.toFloat(), arr.right - w)
         val t = (arr.top + sy * arr.height() - h / 2).coerceIn(arr.top.toFloat(), arr.bottom - h)
@@ -1397,176 +1368,16 @@ class MainActivity : Activity() {
     // =====================================================================
     // Scatto vocale: di' «clic»
     // =====================================================================
-    private val recListener = object : RecognitionListener {
-        override fun onReadyForSpeech(p: Bundle?) { voiceStatus = "in ascolto"; vSessions++; vLastEvent = System.currentTimeMillis() }
-        override fun onBeginningOfSpeech() {}
-        override fun onRmsChanged(v: Float) { vRms = v; vLastEvent = System.currentTimeMillis() }
-        override fun onBufferReceived(b: ByteArray?) {}
-        override fun onEndOfSpeech() {}
-        override fun onError(e: Int) {
-            vLastErr = e
-            vLastEvent = System.currentTimeMillis()
-            if (!voiceOn) return
-            voiceStatus = "errore $e"
-            if (e == 9) {
-                setVmode(0)
-                toast("Serve il permesso del microfono")
-                return
-            }
-            if (e != 6 && e != 7 && e != 8) voiceNote(errText(e))
-            ui.postDelayed({ if (e == 4 || e == 5 || e == 11) recreateVoice() else listenOnce() },
-                if (e == 8) 1000L else if (e == 6 || e == 7) 250L else 1500L)
-        }
-        override fun onResults(r: Bundle?) {
-            val l = r?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-            vLastEvent = System.currentTimeMillis()
-            if (!l.isNullOrEmpty()) vLastText = l.joinToString(" | ")
-            if (!heard(r)) {
-                if (!l.isNullOrEmpty()) voiceNote("Ho sentito: «" + l[0] + "»")
-                if (voiceOn) ui.postDelayed({ listenOnce() }, 100)
-            }
-        }
-        override fun onPartialResults(r: Bundle?) {
-            vLastEvent = System.currentTimeMillis()
-            r?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()?.let { vLastPartial = it }
-            heard(r)
-        }
-        override fun onEvent(t: Int, p: Bundle?) {}
-    }
-
-    private fun errName(e: Int) = when (e) {
-        0 -> "nessuno"
-        1 -> "rete, tempo scaduto (1)"
-        2 -> "rete (2)"
-        3 -> "audio (3)"
-        4 -> "server (4)"
-        5 -> "interno (5)"
-        6 -> "nessun parlato rilevato (6)"
-        7 -> "parlato non riconosciuto (7)"
-        8 -> "servizio occupato (8)"
-        9 -> "permessi (9)"
-        10 -> "troppe richieste (10)"
-        11 -> "server scollegato (11)"
-        12 -> "lingua non supportata (12)"
-        13 -> "lingua non disponibile (13)"
-        else -> "codice $e"
-    }
-
+    /** Pannello in tempo reale nelle impostazioni: fuoco richiesto/applicato e, se attivo, il livello del rumore. */
     private fun refreshVoiceDiag() {
         val t = voiceDiagTv ?: return
+        val sb = StringBuilder(focusLine()).append("\n").append(zoomLine())
         if (vmode == 2) {
             val lvl = ((nLevel / max(1f, nThr)) * 10f).roundToInt().coerceIn(0, 10)
-            val bar = "█".repeat(lvl) + "░".repeat(10 - lvl)
-            t.text = "Scatto a rumore: " + (if (noiseRun) "attivo" else "spento") +
-                "\nLivello: " + bar + "  (pieno = scatta)" +
-                "\nSoglia: " + nThr.toInt() + "  ·  rumore di fondo: " + nBase.toInt() +
-                "\nScatti da rumore: " + nHits +
-                "\nUltimo scatto: " + vShot +
-                "\n" + focusLine()
-            return
+            sb.append("\nRumore: ").append("█".repeat(lvl)).append("░".repeat(10 - lvl)).append("  (pieno = scatta)")
+            sb.append("\nSoglia ").append(nThr.toInt()).append(" · fondo ").append(nBase.toInt()).append(" · scatti ").append(nHits)
         }
-        val lvl = ((vRms + 2f) / 12f * 10f).roundToInt().coerceIn(0, 10)
-        val bar = "█".repeat(lvl) + "░".repeat(10 - lvl)
-        t.text = "Scatto vocale: " + (if (voiceOn) voiceStatus.ifEmpty { "attivo" } else "spento") +
-            "\nMicrofono: " + bar +
-            "\nSessioni di ascolto: " + vSessions +
-            "\n«clic» riconosciuti: " + vHits + "  ·  riavvii: " + vRecreated +
-            "\nUltimo scatto: " + vShot +
-            "\nUltimo errore: " + errName(vLastErr) +
-            "\nSentito (parziale): «" + vLastPartial + "»" +
-            "\nSentito (finale): «" + vLastText + "»" +
-            "\n" + focusLine()
-    }
-
-    private fun errText(e: Int) = when (e) {
-        1, 2 -> "Voce: manca la connessione internet"
-        3 -> "Voce: errore del microfono"
-        4, 11 -> "Voce: il servizio non risponde"
-        5 -> "Voce: errore interno"
-        10 -> "Voce: troppe richieste"
-        12, 13 -> "Voce: lingua italiana non disponibile"
-        else -> "Voce: errore $e"
-    }
-
-    private fun voiceNote(t: String) {
-        val n = System.currentTimeMillis()
-        if (n - lastNote < 2500) return
-        lastNote = n
-        toast(t)
-    }
-
-    private val clicRe = Regex("\\b(cl|kl)i[a-z]{0,3}\\b")
-
-    /** true se ha sentito «clic» (o «click», «clip»…): scatta e riavvia l'ascolto. */
-    private fun heard(r: Bundle?): Boolean {
-        val l = r?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION) ?: return false
-        val hit = l.any { clicRe.containsMatchIn(it.lowercase(Locale.ROOT)) }
-        if (hit) {
-            voiceStatus = "«clic» sentito"
-            vHits++
-            shoot()
-            try { sr?.cancel() } catch (e: Exception) {}
-            ui.postDelayed({ recreateVoice() }, 1500)
-        }
-        return hit
-    }
-
-    private fun listenOnce() {
-        if (!voiceOn) return
-        val s = sr ?: return
-        vLastEvent = System.currentTimeMillis()
-        val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
-            .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-            .putExtra(RecognizerIntent.EXTRA_LANGUAGE, "it-IT")
-            .putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-            .putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5)
-            .putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, packageName)
-        try { s.startListening(i) } catch (e: Exception) { voiceStatus = "avvio non riuscito" }
-    }
-
-    /** Distrugge e ricrea il riconoscitore: il servizio di Google a volte si blocca dopo molti riavvii. */
-    private fun recreateVoice() {
-        if (!voiceOn) return
-        try { sr?.cancel(); sr?.destroy() } catch (e: Exception) {}
-        sr = SpeechRecognizer.createSpeechRecognizer(this).also { it.setRecognitionListener(recListener) }
-        vRecreated++
-        voiceStatus = "riavviato"
-        listenOnce()
-    }
-
-    /** Se per 10 secondi non arriva nessun evento dal riconoscitore, lo ricrea. */
-    private val voiceWatch = object : Runnable {
-        override fun run() {
-            if (voiceOn && sr != null && System.currentTimeMillis() - vLastEvent > 10_000) recreateVoice()
-            if (voiceOn) ui.postDelayed(this, 4000)
-        }
-    }
-
-    private fun startVoice() {
-        if (!voiceOn || sr != null) return
-        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
-            setVmode(0)
-            toast("Riconoscimento vocale non disponibile su questo telefono")
-            return
-        }
-        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 2)
-            return
-        }
-        voiceStatus = "avvio"
-        sr = SpeechRecognizer.createSpeechRecognizer(this).also { it.setRecognitionListener(recListener) }
-        muteBeep(true)
-        listenOnce()
-        ui.removeCallbacks(voiceWatch)
-        ui.postDelayed(voiceWatch, 4000)
-        toast("Scatto vocale attivo: di' «clicca»")
-    }
-
-    private fun stopVoice() {
-        ui.removeCallbacks(voiceWatch)
-        try { sr?.cancel(); sr?.destroy() } catch (e: Exception) {}
-        sr = null
-        muteBeep(false)
+        t.text = sb.toString()
     }
 
     private fun setVmode(m: Int) {
@@ -1578,14 +1389,10 @@ class MainActivity : Activity() {
     }
 
     private fun startMic() {
-        when (vmode) {
-            1 -> startVoice()
-            2 -> startNoise()
-        }
+        if (vmode == 2) startNoise()
     }
 
     private fun stopMic() {
-        stopVoice()
         stopNoise()
     }
 
@@ -1656,14 +1463,6 @@ class MainActivity : Activity() {
         rec = null
     }
 
-    /** Silenzia il "din" che il riconoscimento vocale emette a ogni ascolto. */
-    private fun muteBeep(on: Boolean) {
-        val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-        for (s in intArrayOf(AudioManager.STREAM_NOTIFICATION, AudioManager.STREAM_SYSTEM, AudioManager.STREAM_MUSIC)) {
-            try { am.adjustStreamVolume(s, if (on) AudioManager.ADJUST_MUTE else AudioManager.ADJUST_UNMUTE, 0) } catch (e: Exception) {}
-        }
-    }
-
     // =====================================================================
     // Impostazioni
     // =====================================================================
@@ -1711,20 +1510,17 @@ class MainActivity : Activity() {
 
         box.addView(label("DISTANZA MINIMA DI FUOCO (× QUELLA DICHIARATA DAL TELEFONO)"))
         val base = if (minFocus > 1f) 100f / minFocus else 0f
-        val names = arrayOf("1.0×", "0.85×", "0.7×", "0.6×", "0.5×")
+        val names = arrayOf("1.0×", "0.7×", "0.55×")
         fun mb(i: Int) = btn(names[i] + (if (base > 0f) "\n" + fmtCm(base * MULS[i], false) + " cm" else ""), minMul == MULS[i]) { setMinMul(i) }
         box.addView(row(mb(0), mb(1), mb(2)))
-        box.addView(label("ESPERIMENTO: OLTRE IL LIMITE REALE DELLA LENTE L'IMMAGINE RESTA SFOCATA"))
-        box.addView(row(mb(3), mb(4)))
         box.addView(TextView(this).apply {
-            text = "Sotto il valore dichiarato il telefono può ignorare la richiesta: controlla la riga «Fuoco» nella diagnostica."
+            text = "Alcuni telefoni (es. Galaxy S9) vanno oltre il valore dichiarato, altri lo limitano: controlla la riga «Fuoco»."
             setTextColor(0xFF9A9AA0.toInt()); textSize = 11f; setPadding(0, dp(4), 0, 0)
         })
 
-        box.addView(label("SCATTO A VOCE"))
+        box.addView(label("SCATTO A RUMORE VOCALE"))
         box.addView(row(
             btn("Spento", vmode == 0) { setVmode(0) },
-            btn("Parola «clicca»", vmode == 1) { setVmode(1) },
             btn("Rumore vocale", vmode == 2) { setVmode(2) }
         ))
         if (vmode == 2) {
